@@ -2,7 +2,10 @@ import Groq from 'groq-sdk';
 import { env } from '../config/env';
 import { DATA_TOOL_DEFINITIONS, executeDataTool } from './chat/tools';
 
-const groq = new Groq({ apiKey: env.groqApiKey });
+// The SDK's defaults (60s timeout, retried up to 2 more times on timeout) can leave a request
+// hanging for minutes with zero visible progress if Groq's shared free-tier infra is slow to
+// respond. Bound it much tighter so a stuck call fails fast with a clear error instead.
+const groq = new Groq({ apiKey: env.groqApiKey, timeout: 25_000, maxRetries: 1 });
 
 const ANSWER_TOOL_NAME = 'answer';
 const MAX_TOOL_ITERATIONS = 6;
