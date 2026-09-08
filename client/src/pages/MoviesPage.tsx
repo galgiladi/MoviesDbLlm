@@ -49,7 +49,7 @@ export function MoviesPage() {
         onSearch={(value) => setSearchParams(value ? { q: value } : {})}
       />
 
-      <button type="button" className="link-button" onClick={() => setShowAi((v) => !v)}>
+      <button type="button" className="link-button ask-ai-toggle" onClick={() => setShowAi((v) => !v)}>
         {showAi ? 'Hide Ask AI' : 'Ask AI'}
       </button>
       {showAi && <AiSearchPanel />}
