@@ -1,0 +1,32 @@
+{
+  "name": "elastic-poc-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "seed:download": "ts-node src/scripts/seed/download.ts",
+    "seed:build": "ts-node src/scripts/seed/buildSeed.ts",
+    "seed:index": "ts-node src/scripts/seed/indexSeed.ts",
+    "seed": "npm run seed:download && npm run seed:build && npm run seed:index"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
+    "@elastic/elasticsearch": "^8.15.0",
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.15",
+    "ts-node": "^10.9.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.4"
+  }
+}

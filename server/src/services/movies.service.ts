@@ -1,0 +1,87 @@
+import { esClient } from '../es/client';
+import { MOVIES_INDEX } from '../es/indices';
+import { Movie, MovieInput } from '../types/movie';
+import { invalidateMoviesContext } from './moviesContext.service';
+
+export interface SearchMoviesParams {
+  q?: string;
+  page: number;
+  size: number;
+}
+
+export interface SearchResult<T> {
+  items: T[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+export async function searchMovies({ q, page, size }: SearchMoviesParams): Promise<SearchResult<Movie>> {
+  const query = q && q.trim()
+    ? {
+        multi_match: {
+          query: q.trim(),
+          fields: ['title^3', 'description', 'genres'],
+          fuzziness: 'AUTO',
+        },
+      }
+    : { match_all: {} };
+
+  const result = await esClient.search<Movie>({
+    index: MOVIES_INDEX,
+    query,
+    from: (page - 1) * size,
+    size,
+    sort: q && q.trim() ? ['_score'] : [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
+  });
+
+  const total = typeof result.hits.total === 'number'
+    ? result.hits.total
+    : result.hits.total?.value ?? 0;
+
+  return {
+    items: result.hits.hits.map((hit) => hit._source as Movie),
+    total,
+    page,
+    size,
+  };
+}
+
+export async function getMovieById(id: string): Promise<Movie | null> {
+  try {
+    const result = await esClient.get<Movie>({ index: MOVIES_INDEX, id });
+    return result._source ?? null;
+  } catch (err: any) {
+    if (err?.meta?.statusCode === 404) return null;
+    throw err;
+  }
+}
+
+export async function createMovie(movie: MovieInput): Promise<Movie> {
+  const now = new Date().toISOString();
+  const doc: Movie = { ...movie, createdAt: now, updatedAt: now };
+  await esClient.index({
+    index: MOVIES_INDEX,
+    id: doc.id,
+    document: doc,
+    refresh: 'wait_for',
+  });
+  invalidateMoviesContext();
+  return doc;
+}
+
+export async function patchMovie(id: string, partial: Partial<Movie>): Promise<Movie | null> {
+  const existing = await getMovieById(id);
+  if (!existing) return null;
+
+  const update: Partial<Movie> = { ...partial, updatedAt: new Date().toISOString() };
+  await esClient.update({
+    index: MOVIES_INDEX,
+    id,
+    doc: update,
+    refresh: 'wait_for',
+  });
+  invalidateMoviesContext();
+
+  return { ...existing, ...update };
+}
