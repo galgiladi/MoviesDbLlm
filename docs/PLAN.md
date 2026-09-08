@@ -111,3 +111,81 @@ Small root `package.json` with `concurrently` to run `docker compose up`, `serve
 2. `cd server && npm install && npm run seed` — confirm `seed-movies.json`/`seed-actors.json` produced and bulk-indexed (script logs counts); spot check via `GET http://localhost:9200/movies/_count` and `_search`.
 3. `npm run dev` (server) — hit `GET /api/movies?q=matrix` and `GET /api/actors?q=keanu` with curl/Postman, confirm results.
 4. `cd client && npm install && npm run dev` — in the browser: search movies, open a movie detail page, edit its score and confirm it persists on refresh, use "Add Movie" with a real `imdb.com/title/tt...` URL and confirm it appears with description/cast, open Actors page and search by name and by movie.
+
+---
+
+## Phase 2 — Scaling up (current)
+
+Status: implemented. This section describes what's actually in the code today; see [CLAUDE.md](../CLAUDE.md)
+for the up-to-date file-by-file summary.
+
+### Decisions locked in
+- **Engine**: stays **Elasticsearch** — an OpenSearch swap was considered (to mirror the user's real production
+  stack) but decided against for this pass to avoid extra migration risk/effort; revisit later if there's a
+  concrete reason to. No client library or Docker service changes as a result.
+- **Scale**: raise the seed cap from ~1,000 to **top 100,000 movies by `numVotes`** (still `titleType=movie`
+  only — tvSeries/videoGame explicitly deferred). This does **not** meaningfully change indexing runtime: the
+  pipeline already has to fully stream-scan `title.basics`/`title.ratings` (fixed-size full-file passes
+  regardless of N) to compute the top-N, and fully stream-scan `title.principals` to pull credits for whichever
+  tconsts were selected. Only the *output* size scales with N, and bulk-indexing 100k small JSON docs into
+  Elasticsearch is still on the order of seconds to low minutes, not the bottleneck of the pipeline.
+- **Roles**: expand beyond actors-only to **actor, actress, director, writer, producer** (all pulled from
+  `title.principals`, which already carries these categories for top-billed credits — no need to add
+  `title.crew.tsv` as a separate download for this pass).
+- **Plot summaries**: explicitly **deferred**. IMDb's bulk datasets have zero plot/description field anywhere
+  (`title.basics` only has `tconst, titleType, primaryTitle, originalTitle, isAdult, startYear, endYear,
+  runtimeMinutes, genres`). The only free source of real plot text is scraping each IMDb title page's `ld+json`
+  block (what `imdbScrape.service.ts` already does for the single-URL "Add Movie" flow) — not viable in bulk for
+  100k movies. Seeded movies keep the current templated description; real plot text (via TMDb API) stays a
+  future enrichment step, added without needing to redo this phase.
+- **Index naming**: rename `movies` → `titles` and `actors` → `people` now, ahead of actually needing the
+  broader scope (tvSeries/videoGame, more roles) — avoids a rename/migration later. HTTP route paths
+  (`/api/movies`, `/api/actors`) stay as-is for this pass to minimize client churn; only the Elasticsearch index
+  names and internal service naming change. Revisit route naming if/when it becomes worth the churn.
+
+### Updated Elasticsearch modeling
+
+Two indices, same "denormalize both directions, no joins" approach as Phase 1, with roles now carried via a
+`category` field instead of being actors-only:
+
+**`titles`** (was `movies`)
+- `id` (keyword, = tconst), `title` (text + `.keyword`), `year` (int), `genres` (keyword[]), `runtimeMinutes` (int)
+- `score` (float, = averageRating), `numVotes` (int)
+- `description` (text — still templated, no real plot yet)
+- `imdbUrl` (keyword), `posterUrl` (keyword, optional)
+- `credits`: nested `[{ personId, name, category, character? }]` — `category` is one of
+  `actor|actress|director|writer|producer`; `character` only present for actor/actress. One unified nested array
+  (not separate `cast`/`crew` arrays) so adding more roles later doesn't require a schema change.
+- `createdAt`/`updatedAt` (date)
+
+**`people`** (was `actors`)
+- `id` (keyword, = nconst), `name` (text + `.keyword`), `birthYear` (int, optional)
+- `filmography`: nested `[{ titleId, title, category, character? }]` — denormalized, powers "search people by
+  title/role" without a join. **Not** denormalizing `genres`/`startYear` onto each filmography entry yet (that
+  was specifically to support a harder "same-year cross-genre" query class that's out of scope for now); add it
+  later if/when that becomes a real goal, since it's an additive field, not a redesign.
+
+### Backend structure changes
+- `server/src/es/` (`client.ts`, `indices.ts`) unchanged in location/client — only `indices.ts`'s index
+  constants/mappings changed (`TITLES_INDEX`/`PEOPLE_INDEX`, `credits`/`filmography` nested fields with
+  `category`). `server/.env`'s `ES_NODE` and `docker-compose.yml`'s `elasticsearch`/`kibana` services are
+  unchanged, since the engine didn't change.
+- `server/src/scripts/seed/`: same three-step shape (`download` → `buildSeed` → `indexSeed`), but `buildSeed.ts`
+  raises the cap to 100,000, pulls the expanded role set from `title.principals`, and writes to the renamed
+  `titles`/`people` shape; `indexSeed.ts` bulk-indexes via the same `@elastic/elasticsearch` client, just against
+  the renamed indices.
+- `server/src/services/movies.service.ts` / `actors.service.ts`: same responsibilities, updated for the new
+  index names and unified `credits`/`filmography` shape.
+- Client (`client/src/`): types/api wrappers updated for the new field shape (`credits` replacing `cast`, role
+  `category` on each credit; `filmography` replacing `movies` with a `titleId` reference), page/component
+  structure unchanged — reused as-is per the "same frontend" decision.
+
+### Verification
+1. `docker compose up -d` — confirm ES reachable at `http://localhost:9200` and Kibana at `:5601` (unchanged
+   from Phase 1).
+2. `cd server && npm run seed` — confirm the download/build/index steps complete and log up to 100,000 titles
+   with populated `credits` spanning all five role categories; spot check via
+   `GET http://localhost:9200/titles/_count`.
+3. `npm run dev` (root) — confirm `GET /api/movies?q=...` and `GET /api/actors?q=...` still work end-to-end
+   against the renamed indices, and the existing client pages (search, detail, actors) render correctly with no
+   code changes needed beyond the type/field updates above.

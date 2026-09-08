@@ -23,6 +23,8 @@ export function MovieDetailPage() {
   if (loading) return <div className="page">Loading...</div>;
   if (error || !movie) return <div className="page error-text">{error ?? 'Movie not found.'}</div>;
 
+  const cast = movie.credits.filter((c) => c.category === 'actor' || c.category === 'actress');
+
   return (
     <div className="page">
       <Link to="/" className="back-link">
@@ -65,12 +67,12 @@ export function MovieDetailPage() {
             View on IMDb ↗
           </a>
 
-          {movie.cast.length > 0 && (
+          {cast.length > 0 && (
             <>
               <h2>Cast</h2>
               <div className="cast-list">
-                {movie.cast.map((c) => (
-                  <Link key={c.actorId} to={`/actors/${c.actorId}`} className="cast-chip">
+                {cast.map((c) => (
+                  <Link key={c.personId} to={`/actors/${c.personId}`} className="cast-chip">
                     {c.name}
                     {c.character && <span className="muted"> as {c.character}</span>}
                   </Link>

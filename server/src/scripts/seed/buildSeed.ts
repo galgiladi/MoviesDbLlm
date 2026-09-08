@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { CreditCategory } from '../../types/movie';
 import {
   streamTsvGz,
   nullable,
@@ -12,9 +13,9 @@ import {
 const CACHE_DIR = path.join(__dirname, '..', '..', '..', 'data', '.cache');
 const DATA_DIR = path.join(__dirname, '..', '..', '..', 'data');
 
-const TARGET_MOVIE_COUNT = 1000;
-const RATING_CANDIDATE_POOL = 20000; // generous buffer: many top-voted rows are TV series/episodes, not movies
-const MAX_CAST_PER_MOVIE = 8;
+const TARGET_MOVIE_COUNT = 100_000;
+const CREDIT_CATEGORIES: readonly CreditCategory[] = ['actor', 'actress', 'director', 'writer', 'producer'];
+const MAX_CREDITS_PER_MOVIE = 15;
 
 interface RatingRow {
   tconst: string;
@@ -32,8 +33,9 @@ interface MovieBase {
   numVotes?: number;
 }
 
-interface CastRef {
-  actorId: string;
+interface CreditRef {
+  personId: string;
+  category: CreditCategory;
   ordering: number;
   character?: string;
 }
@@ -48,14 +50,14 @@ interface SeedMovie {
   numVotes?: number;
   description: string;
   imdbUrl: string;
-  cast: { actorId: string; name: string; character?: string }[];
+  credits: { personId: string; name: string; category: CreditCategory; character?: string }[];
 }
 
 interface SeedActor {
   id: string;
   name: string;
   birthYear?: number;
-  movies: { movieId: string; title: string; character?: string }[];
+  filmography: { titleId: string; title: string; category: CreditCategory; character?: string }[];
 }
 
 function templateDescription(m: MovieBase): string {
@@ -64,19 +66,25 @@ function templateDescription(m: MovieBase): string {
   return `${m.title}${yearText} is a ${genreText} film.`;
 }
 
-async function loadTopRatingCandidates(): Promise<Map<string, RatingRow>> {
+async function loadRatingCandidates(): Promise<Map<string, RatingRow>> {
   console.log('Reading title.ratings.tsv.gz ...');
-  const all: RatingRow[] = [];
+  // No pool cap here: at 100,000-movie scale, trimming to an arbitrary top-N-by-votes window
+  // (regardless of title type) risks running out of *movie*-type matches before the target is
+  // reached, since tvSeries/tvEpisode/videoGame titles compete for the same top-voted ranks.
+  // We're already reading every rated row into memory below, so a cap wouldn't save memory
+  // anyway - it would only reintroduce that risk.
+  const candidates = new Map<string, RatingRow>();
+  let scanned = 0;
   for await (const row of streamTsvGz(path.join(CACHE_DIR, 'title.ratings.tsv.gz'))) {
+    scanned += 1;
+    if (scanned % 500_000 === 0) console.log(`  read ${scanned.toLocaleString()} rating rows ...`);
     const numVotes = toIntOrUndefined(row.numVotes);
     const averageRating = toFloatOrUndefined(row.averageRating);
     if (numVotes === undefined || averageRating === undefined) continue;
-    all.push({ tconst: row.tconst, averageRating, numVotes });
+    candidates.set(row.tconst, { tconst: row.tconst, averageRating, numVotes });
   }
-  all.sort((a, b) => b.numVotes - a.numVotes);
-  const top = all.slice(0, RATING_CANDIDATE_POOL);
-  console.log(`Loaded ${all.length} rated titles, keeping top ${top.length} candidates by vote count.`);
-  return new Map(top.map((r) => [r.tconst, r]));
+  console.log(`Loaded ${candidates.size.toLocaleString()} rated titles.`);
+  return candidates;
 }
 
 async function findTopMovies(candidates: Map<string, RatingRow>): Promise<MovieBase[]> {
@@ -107,13 +115,13 @@ async function findTopMovies(candidates: Map<string, RatingRow>): Promise<MovieB
 
   matches.sort((a, b) => (b.numVotes ?? 0) - (a.numVotes ?? 0));
   const top = matches.slice(0, TARGET_MOVIE_COUNT);
-  console.log(`Found ${matches.length} candidate movies, keeping top ${top.length}.`);
+  console.log(`Found ${matches.length.toLocaleString()} candidate movies, keeping top ${top.length.toLocaleString()}.`);
   return top;
 }
 
-async function loadCastForMovies(movieIds: Set<string>): Promise<Map<string, CastRef[]>> {
-  console.log('Scanning title.principals.tsv.gz for cast (this is the largest file, may take a while) ...');
-  const castByMovie = new Map<string, CastRef[]>();
+async function loadCreditsForMovies(movieIds: Set<string>): Promise<Map<string, CreditRef[]>> {
+  console.log('Scanning title.principals.tsv.gz for credits (this is the largest file, may take a while) ...');
+  const creditsByMovie = new Map<string, CreditRef[]>();
   let scanned = 0;
 
   for await (const row of streamTsvGz(path.join(CACHE_DIR, 'title.principals.tsv.gz'))) {
@@ -121,28 +129,29 @@ async function loadCastForMovies(movieIds: Set<string>): Promise<Map<string, Cas
     if (scanned % 5_000_000 === 0) console.log(`  scanned ${scanned.toLocaleString()} principal rows ...`);
 
     if (!movieIds.has(row.tconst)) continue;
-    if (row.category !== 'actor' && row.category !== 'actress') continue;
+    if (!(CREDIT_CATEGORIES as readonly string[]).includes(row.category)) continue;
 
-    const list = castByMovie.get(row.tconst) ?? [];
+    const list = creditsByMovie.get(row.tconst) ?? [];
     list.push({
-      actorId: row.nconst,
+      personId: row.nconst,
+      category: row.category as CreditCategory,
       ordering: toIntOrUndefined(row.ordering) ?? 999,
       character: parseFirstCharacter(row.characters),
     });
-    castByMovie.set(row.tconst, list);
+    creditsByMovie.set(row.tconst, list);
   }
 
-  for (const [tconst, list] of castByMovie) {
+  for (const [tconst, list] of creditsByMovie) {
     list.sort((a, b) => a.ordering - b.ordering);
-    castByMovie.set(tconst, list.slice(0, MAX_CAST_PER_MOVIE));
+    creditsByMovie.set(tconst, list.slice(0, MAX_CREDITS_PER_MOVIE));
   }
 
-  console.log(`Collected cast for ${castByMovie.size} movies.`);
-  return castByMovie;
+  console.log(`Collected credits for ${creditsByMovie.size.toLocaleString()} movies.`);
+  return creditsByMovie;
 }
 
-async function loadActorNames(actorIds: Set<string>): Promise<Map<string, { name: string; birthYear?: number }>> {
-  console.log('Scanning name.basics.tsv.gz for actor names ...');
+async function loadPersonNames(personIds: Set<string>): Promise<Map<string, { name: string; birthYear?: number }>> {
+  console.log('Scanning name.basics.tsv.gz for person names ...');
   const names = new Map<string, { name: string; birthYear?: number }>();
   let scanned = 0;
 
@@ -150,12 +159,12 @@ async function loadActorNames(actorIds: Set<string>): Promise<Map<string, { name
     scanned += 1;
     if (scanned % 2_000_000 === 0) console.log(`  scanned ${scanned.toLocaleString()} names ...`);
 
-    if (!actorIds.has(row.nconst)) continue;
+    if (!personIds.has(row.nconst)) continue;
     names.set(row.nconst, { name: row.primaryName, birthYear: toIntOrUndefined(row.birthYear) });
-    if (names.size === actorIds.size) break;
+    if (names.size === personIds.size) break;
   }
 
-  console.log(`Resolved ${names.size}/${actorIds.size} actor names.`);
+  console.log(`Resolved ${names.size.toLocaleString()}/${personIds.size.toLocaleString()} person names.`);
   return names;
 }
 
@@ -167,51 +176,52 @@ async function main() {
     }
   }
 
-  const candidates = await loadTopRatingCandidates();
+  const candidates = await loadRatingCandidates();
   const topMovies = await findTopMovies(candidates);
   const movieIds = new Set(topMovies.map((m) => m.id));
 
-  const castByMovie = await loadCastForMovies(movieIds);
-  const actorIds = new Set<string>();
-  for (const list of castByMovie.values()) {
-    for (const c of list) actorIds.add(c.actorId);
+  const creditsByMovie = await loadCreditsForMovies(movieIds);
+  const personIds = new Set<string>();
+  for (const list of creditsByMovie.values()) {
+    for (const c of list) personIds.add(c.personId);
   }
 
-  const actorNames = await loadActorNames(actorIds);
+  const personNames = await loadPersonNames(personIds);
 
   const seedMovies: SeedMovie[] = topMovies.map((m) => ({
     ...m,
     description: templateDescription(m),
     imdbUrl: `https://www.imdb.com/title/${m.id}/`,
-    cast: (castByMovie.get(m.id) ?? [])
-      .filter((c) => actorNames.has(c.actorId))
+    credits: (creditsByMovie.get(m.id) ?? [])
+      .filter((c) => personNames.has(c.personId))
       .map((c) => ({
-        actorId: c.actorId,
-        name: actorNames.get(c.actorId)!.name,
+        personId: c.personId,
+        name: personNames.get(c.personId)!.name,
+        category: c.category,
         character: c.character,
       })),
   }));
 
-  const actorsMap = new Map<string, SeedActor>();
+  const peopleMap = new Map<string, SeedActor>();
   for (const movie of seedMovies) {
-    for (const cast of movie.cast) {
-      const info = actorNames.get(cast.actorId)!;
-      const actor = actorsMap.get(cast.actorId) ?? {
-        id: cast.actorId,
+    for (const credit of movie.credits) {
+      const info = personNames.get(credit.personId)!;
+      const person = peopleMap.get(credit.personId) ?? {
+        id: credit.personId,
         name: info.name,
         birthYear: info.birthYear,
-        movies: [],
+        filmography: [],
       };
-      actor.movies.push({ movieId: movie.id, title: movie.title, character: cast.character });
-      actorsMap.set(cast.actorId, actor);
+      person.filmography.push({ titleId: movie.id, title: movie.title, category: credit.category, character: credit.character });
+      peopleMap.set(credit.personId, person);
     }
   }
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.writeFileSync(path.join(DATA_DIR, 'seed-movies.json'), JSON.stringify(seedMovies, null, 2));
-  fs.writeFileSync(path.join(DATA_DIR, 'seed-actors.json'), JSON.stringify([...actorsMap.values()], null, 2));
+  fs.writeFileSync(path.join(DATA_DIR, 'seed-actors.json'), JSON.stringify([...peopleMap.values()], null, 2));
 
-  console.log(`Wrote ${seedMovies.length} movies and ${actorsMap.size} actors to server/data/.`);
+  console.log(`Wrote ${seedMovies.length.toLocaleString()} movies and ${peopleMap.size.toLocaleString()} people to server/data/.`);
 }
 
 main().catch((err) => {

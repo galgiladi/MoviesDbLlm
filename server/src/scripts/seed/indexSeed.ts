@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { esClient } from '../../es/client';
-import { ensureIndices, MOVIES_INDEX, ACTORS_INDEX } from '../../es/indices';
+import { ensureIndices, TITLES_INDEX, PEOPLE_INDEX } from '../../es/indices';
 import { Movie } from '../../types/movie';
 import { Actor } from '../../types/actor';
 
@@ -37,12 +37,12 @@ async function main() {
 
   const now = new Date().toISOString();
   await bulkIndex<Movie>(
-    MOVIES_INDEX,
+    TITLES_INDEX,
     movies.map((m) => ({ ...m, createdAt: now, updatedAt: now })),
   );
-  await bulkIndex<Actor>(ACTORS_INDEX, actors);
+  await bulkIndex<Actor>(PEOPLE_INDEX, actors);
 
-  await esClient.indices.refresh({ index: `${MOVIES_INDEX},${ACTORS_INDEX}` });
+  await esClient.indices.refresh({ index: `${TITLES_INDEX},${PEOPLE_INDEX}` });
   console.log('Seeding complete.');
 }
 

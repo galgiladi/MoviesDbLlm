@@ -1,6 +1,9 @@
-export interface CastMember {
-  actorId: string;
+export type CreditCategory = 'actor' | 'actress' | 'director' | 'writer' | 'producer';
+
+export interface Credit {
+  personId: string;
   name: string;
+  category: CreditCategory;
   character?: string;
 }
 
@@ -15,7 +18,7 @@ export interface Movie {
   description: string;
   imdbUrl: string;
   posterUrl?: string;
-  cast: CastMember[];
+  credits: Credit[];
   createdAt: string;
   updatedAt: string;
 }

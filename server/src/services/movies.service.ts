@@ -1,5 +1,5 @@
 import { esClient } from '../es/client';
-import { MOVIES_INDEX } from '../es/indices';
+import { TITLES_INDEX } from '../es/indices';
 import { Movie, MovieInput } from '../types/movie';
 import { invalidateMoviesContext } from './moviesContext.service';
 
@@ -28,7 +28,7 @@ export async function searchMovies({ q, page, size }: SearchMoviesParams): Promi
     : { match_all: {} };
 
   const result = await esClient.search<Movie>({
-    index: MOVIES_INDEX,
+    index: TITLES_INDEX,
     query,
     from: (page - 1) * size,
     size,
@@ -49,7 +49,7 @@ export async function searchMovies({ q, page, size }: SearchMoviesParams): Promi
 
 export async function getMovieById(id: string): Promise<Movie | null> {
   try {
-    const result = await esClient.get<Movie>({ index: MOVIES_INDEX, id });
+    const result = await esClient.get<Movie>({ index: TITLES_INDEX, id });
     return result._source ?? null;
   } catch (err: any) {
     if (err?.meta?.statusCode === 404) return null;
@@ -61,7 +61,7 @@ export async function createMovie(movie: MovieInput): Promise<Movie> {
   const now = new Date().toISOString();
   const doc: Movie = { ...movie, createdAt: now, updatedAt: now };
   await esClient.index({
-    index: MOVIES_INDEX,
+    index: TITLES_INDEX,
     id: doc.id,
     document: doc,
     refresh: 'wait_for',
@@ -76,7 +76,7 @@ export async function patchMovie(id: string, partial: Partial<Movie>): Promise<M
 
   const update: Partial<Movie> = { ...partial, updatedAt: new Date().toISOString() };
   await esClient.update({
-    index: MOVIES_INDEX,
+    index: TITLES_INDEX,
     id,
     doc: update,
     refresh: 'wait_for',

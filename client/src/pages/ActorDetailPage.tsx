@@ -37,14 +37,16 @@ export function ActorDetailPage() {
       </div>
 
       <h2>Movies in this index</h2>
-      {actor.movies.length === 0 ? (
+      {actor.filmography.length === 0 ? (
         <p className="muted">No movies linked yet.</p>
       ) : (
         <ul className="actor-movie-list">
-          {actor.movies.map((m) => (
-            <li key={m.movieId}>
-              <Link to={`/movies/${m.movieId}`}>{m.title}</Link>
-              {m.character && <span className="muted"> as {m.character}</span>}
+          {actor.filmography.map((f) => (
+            <li key={f.titleId}>
+              <Link to={`/movies/${f.titleId}`}>{f.title}</Link>
+              {' '}
+              <span className="muted">({f.category})</span>
+              {f.character && <span className="muted"> as {f.character}</span>}
             </li>
           ))}
         </ul>

@@ -1,14 +1,14 @@
 import { esClient } from './client';
 
-export const MOVIES_INDEX = 'movies';
-export const ACTORS_INDEX = 'actors';
+export const TITLES_INDEX = 'titles';
+export const PEOPLE_INDEX = 'people';
 
 const textWithKeyword = {
   type: 'text',
   fields: { keyword: { type: 'keyword', ignore_above: 512 } },
 } as const;
 
-const moviesMapping = {
+const titlesMapping = {
   properties: {
     id: { type: 'keyword' },
     title: textWithKeyword,
@@ -20,11 +20,12 @@ const moviesMapping = {
     description: { type: 'text' },
     imdbUrl: { type: 'keyword' },
     posterUrl: { type: 'keyword' },
-    cast: {
+    credits: {
       type: 'nested',
       properties: {
-        actorId: { type: 'keyword' },
+        personId: { type: 'keyword' },
         name: textWithKeyword,
+        category: { type: 'keyword' },
         character: { type: 'text' },
       },
     },
@@ -33,16 +34,17 @@ const moviesMapping = {
   },
 } as const;
 
-const actorsMapping = {
+const peopleMapping = {
   properties: {
     id: { type: 'keyword' },
     name: textWithKeyword,
     birthYear: { type: 'integer' },
-    movies: {
+    filmography: {
       type: 'nested',
       properties: {
-        movieId: { type: 'keyword' },
+        titleId: { type: 'keyword' },
         title: textWithKeyword,
+        category: { type: 'keyword' },
         character: { type: 'text' },
       },
     },
@@ -58,6 +60,6 @@ async function ensureIndex(index: string, mappings: Record<string, unknown>) {
 }
 
 export async function ensureIndices() {
-  await ensureIndex(MOVIES_INDEX, moviesMapping);
-  await ensureIndex(ACTORS_INDEX, actorsMapping);
+  await ensureIndex(TITLES_INDEX, titlesMapping);
+  await ensureIndex(PEOPLE_INDEX, peopleMapping);
 }

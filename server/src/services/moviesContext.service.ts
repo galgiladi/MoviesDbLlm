@@ -1,9 +1,11 @@
 import { esClient } from '../es/client';
-import { MOVIES_INDEX } from '../es/indices';
+import { TITLES_INDEX } from '../es/indices';
 import { Movie } from '../types/movie';
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-// TODO: revert to 1000 - temporarily capped low to cheaply smoke-test the Anthropic key/billing with fewer input tokens
+// TODO: revert to a much higher cap - temporarily capped low to cheaply smoke-test the Anthropic key/billing
+// with fewer input tokens. Now that the titles index can hold up to 100,000 movies, this needs a real
+// retrieval redesign (not just raising the number) before Ask AI can reason over the whole catalog.
 const MAX_MOVIES = 20;
 
 interface ChatContextMovie {
@@ -14,7 +16,7 @@ interface ChatContextMovie {
   description: string;
   score?: number;
   numVotes?: number;
-  cast: { actorId: string; name: string }[];
+  credits: { personId: string; name: string; category: string }[];
 }
 
 let cachedBlock: string | null = null;
@@ -27,7 +29,7 @@ export async function getMoviesContextBlock(): Promise<string> {
   }
 
   const result = await esClient.search<Movie>({
-    index: MOVIES_INDEX,
+    index: TITLES_INDEX,
     query: { match_all: {} },
     size: MAX_MOVIES,
   });
@@ -42,7 +44,7 @@ export async function getMoviesContextBlock(): Promise<string> {
       description: movie.description,
       score: movie.score,
       numVotes: movie.numVotes,
-      cast: movie.cast.map((c) => ({ actorId: c.actorId, name: c.name })),
+      credits: movie.credits.map((c) => ({ personId: c.personId, name: c.name, category: c.category })),
     };
   });
 

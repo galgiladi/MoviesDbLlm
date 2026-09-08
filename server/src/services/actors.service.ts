@@ -1,6 +1,6 @@
 import { esClient } from '../es/client';
-import { ACTORS_INDEX } from '../es/indices';
-import { Actor, ActorMovie } from '../types/actor';
+import { PEOPLE_INDEX } from '../es/indices';
+import { Actor, FilmographyEntry } from '../types/actor';
 import { SearchResult } from './movies.service';
 
 export interface SearchActorsParams {
@@ -16,8 +16,8 @@ export async function searchActors({ q, movieId, page, size }: SearchActorsParam
   if (movieId) {
     query = {
       nested: {
-        path: 'movies',
-        query: { term: { 'movies.movieId': movieId } },
+        path: 'filmography',
+        query: { term: { 'filmography.titleId': movieId } },
       },
     };
   } else if (q && q.trim()) {
@@ -33,7 +33,7 @@ export async function searchActors({ q, movieId, page, size }: SearchActorsParam
   }
 
   const result = await esClient.search<Actor>({
-    index: ACTORS_INDEX,
+    index: PEOPLE_INDEX,
     query,
     from: (page - 1) * size,
     size,
@@ -54,7 +54,7 @@ export async function searchActors({ q, movieId, page, size }: SearchActorsParam
 
 export async function getActorById(id: string): Promise<Actor | null> {
   try {
-    const result = await esClient.get<Actor>({ index: ACTORS_INDEX, id });
+    const result = await esClient.get<Actor>({ index: PEOPLE_INDEX, id });
     return result._source ?? null;
   } catch (err: any) {
     if (err?.meta?.statusCode === 404) return null;
@@ -73,7 +73,7 @@ function slugifyName(name: string): string {
 
 async function findActorByExactName(name: string): Promise<Actor | null> {
   const result = await esClient.search<Actor>({
-    index: ACTORS_INDEX,
+    index: PEOPLE_INDEX,
     query: { term: { 'name.keyword': name } },
     size: 1,
   });
@@ -82,30 +82,30 @@ async function findActorByExactName(name: string): Promise<Actor | null> {
 }
 
 /**
- * Finds an actor by exact name or creates one, then ensures the given movie
- * reference is present on their `movies` list. Used when a movie is added
- * via IMDb-URL scrape, where we only have actor names (no stable nconst).
+ * Finds a person by exact name or creates one, then ensures the given title reference
+ * is present on their `filmography` list. Used when a movie is added via IMDb-URL scrape,
+ * where we only have actor names (no stable IMDb nconst).
  */
-export async function upsertActorForMovie(name: string, movieRef: ActorMovie): Promise<Actor> {
+export async function upsertActorForMovie(name: string, filmographyRef: FilmographyEntry): Promise<Actor> {
   const existing = await findActorByExactName(name);
 
   if (existing) {
-    const alreadyLinked = existing.movies.some((m) => m.movieId === movieRef.movieId);
-    const movies = alreadyLinked ? existing.movies : [...existing.movies, movieRef];
+    const alreadyLinked = existing.filmography.some((f) => f.titleId === filmographyRef.titleId);
+    const filmography = alreadyLinked ? existing.filmography : [...existing.filmography, filmographyRef];
     if (!alreadyLinked) {
       await esClient.update({
-        index: ACTORS_INDEX,
+        index: PEOPLE_INDEX,
         id: existing.id,
-        doc: { movies },
+        doc: { filmography },
         refresh: 'wait_for',
       });
     }
-    return { ...existing, movies };
+    return { ...existing, filmography };
   }
 
-  const actor: Actor = { id: slugifyName(name), name, movies: [movieRef] };
+  const actor: Actor = { id: slugifyName(name), name, filmography: [filmographyRef] };
   await esClient.index({
-    index: ACTORS_INDEX,
+    index: PEOPLE_INDEX,
     id: actor.id,
     document: actor,
     refresh: 'wait_for',

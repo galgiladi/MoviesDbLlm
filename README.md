@@ -1,8 +1,8 @@
 # Movie Explorer (Elasticsearch POC)
 
-React + TypeScript client, Node/Express + TypeScript API, backed by Elasticsearch. Indexes ~1000 real movies
-(and their cast) from IMDb's official non-commercial datasets, with basic server-side search, inline score
-editing, and adding new movies by pasting an IMDb URL.
+React + TypeScript client, Node/Express + TypeScript API, backed by Elasticsearch. Indexes up to 100,000 real
+movies (and their actor/actress/director/writer/producer credits) from IMDb's official non-commercial datasets,
+with basic server-side search, inline score editing, and adding new movies by pasting an IMDb URL.
 
 ## Prerequisites
 
@@ -48,10 +48,13 @@ This runs three steps:
    `name.basics`) from `datasets.imdbws.com` into `server/data/.cache/`. **`title.principals.tsv.gz` is a few
    hundred MB** — this step can take several minutes depending on your connection, and re-runs are skipped if
    the files already exist.
-2. `seed:build` — streams those files, picks the ~1000 most-voted real movies, pulls their top-billed cast, and
-   writes `server/data/seed-movies.json` + `server/data/seed-actors.json`. Also takes a few minutes since it has
-   to scan the full dataset files.
-3. `seed:index` — creates the `movies`/`actors` Elasticsearch indices (if missing) and bulk-indexes both files.
+2. `seed:build` — streams those files (never loading the multi-GB ones fully into memory), picks the top
+   100,000 most-voted real movies, pulls up to 15 top-billed credits per movie across
+   actor/actress/director/writer/producer roles, and writes `server/data/seed-movies.json` +
+   `server/data/seed-actors.json`. This is the slowest step — it does two full linear scans of the large
+   `title.principals.tsv.gz`/`name.basics.tsv.gz` files (tens of millions of rows each), so expect several
+   minutes regardless of the movie count.
+3. `seed:index` — creates the `titles`/`people` Elasticsearch indices (if missing) and bulk-indexes both files.
 
 IMDb's bulk datasets don't include plot summaries, so seeded movies get a short auto-generated description.
 Movies added later via "Add Movie" (by pasting an IMDb URL) get their real plot description scraped from that
@@ -74,8 +77,9 @@ This runs the API on `http://localhost:4000` and the client on `http://localhost
 - `GET /api/movies/:id`
 - `POST /api/movies { imdbUrl }` — scrape an IMDb title page and index it (creates linked actors as needed)
 - `PATCH /api/movies/:id { score, description?, title? }` — edit a movie
-- `GET /api/actors?q=&movieId=&page=&size=` — search actors by name, or list an entire movie's cast via `movieId`
-- `GET /api/actors/:id`
+- `GET /api/actors?q=&movieId=&page=&size=` — search people by name, or list an entire movie's credits via `movieId`
+- `GET /api/actors/:id` — includes `filmography`, each entry tagged with its role
+  (`actor`/`actress`/`director`/`writer`/`producer`)
 - `POST /api/chat { question }` — AI chat search (SSE); see [docs/ai-chat-search.md](docs/ai-chat-search.md).
   Requires `ANTHROPIC_API_KEY` in `server/.env`.
 

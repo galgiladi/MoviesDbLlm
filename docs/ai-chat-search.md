@@ -18,25 +18,32 @@ Decisions made along the way:
 - **Conversation scope**: stateless — one question in, one answer out, no multi-turn history for v1.
 - **Data-access approach**: an earlier design gave Claude a tool to author its own Elasticsearch query DSL at
   answer time. That was rejected as too risky (script-injection/DoS surface from letting a model author live
-  query DSL). Given the dataset is small (1000 movies, ~1.27MB in `server/data/seed-movies.json`, each with
-  nested cast), the safer design is **context stuffing**: the server runs one fixed, hardcoded query it wrote
-  itself (a plain `match_all` fetch of the whole `movies` index — never a model-authored query), trims it to
+  query DSL). At the time this was designed, the dataset was small enough (1000 movies) to stuff the entire
+  index into context; the safer design is **context stuffing**: the server runs one fixed, hardcoded query it
+  wrote itself (a plain `match_all` fetch of the `titles` index — never a model-authored query), trims it to
   relevant fields, and hands that as ground-truth context to Claude. Claude then computes answers (counts,
   "most appearances," filters by year/genre, etc.) purely by reasoning over the data it was given. **Claude
   never sends a query to Elasticsearch itself** — eliminating the entire class of injection/DoS risk that came
   with letting the model author arbitrary query DSL against a live cluster. This trades that risk for token
   cost, mitigated with Anthropic prompt caching.
+  **Since then, the seed pipeline was scaled up to 100,000 movies** (see [PLAN.md § Phase
+  2](PLAN.md#phase-2--scaling-up-current)), which no longer fits in context — `moviesContext.service.ts` was
+  left fetching only the first `MAX_MOVIES = 20` as a stopgap rather than redesigned, so Ask AI currently
+  reasons over a small, arbitrary slice of the catalog, not the whole thing. Making it work at full scale needs
+  real retrieval (tool-based lookups instead of stuffing), which is intentionally not part of this doc's design
+  — see the "Known follow-ups" note in [CLAUDE.md](../CLAUDE.md).
 
 ## Architecture
 
 **Context-stuffed single-turn completion, server-side.** The client POSTs the question to `/api/chat`. The
 server:
 
-1. Builds (or reuses a cached) **trimmed data context**: one `match_all`-style fetch of the entire `movies`
-   index, mapped down to only the fields useful for reasoning: `id, title, year, genres, description, score,
-   numVotes, cast: [{actorId, name}]`. Dropped: `imdbUrl`, `posterUrl`, `runtimeMinutes`, `createdAt`,
-   `updatedAt` — not needed to answer questions, only used by detail pages the UI already has. The `actors`
-   index is not fetched separately — `movies.cast` already contains every actor/movie relationship needed.
+1. Builds (or reuses a cached) **trimmed data context**: one `match_all`-style fetch of (only the first
+   `MAX_MOVIES` = 20 of) the `titles` index, mapped down to only the fields useful for reasoning: `id, title,
+   year, genres, description, score, numVotes, credits: [{personId, name, category}]`. Dropped: `imdbUrl`,
+   `posterUrl`, `runtimeMinutes`, `createdAt`, `updatedAt`, and each credit's `character` — not needed to answer
+   questions, only used by detail pages the UI already has. The `people` index is not fetched separately —
+   `titles.credits` already contains every person/movie relationship needed.
 2. Sends Claude a system prompt containing that context block (marked for Anthropic prompt caching), today's
    date (so "recent 10 years" resolves correctly), and instructions to answer only from the given data and
    ground every claim in it.

@@ -9,7 +9,7 @@ export function ActorCard({ actor }: { actor: Actor }) {
         <h3>{actor.name}</h3>
         {actor.birthYear && <p className="muted">b. {actor.birthYear}</p>}
         <p className="muted">
-          {actor.movies.length} movie{actor.movies.length === 1 ? '' : 's'} in index
+          {actor.filmography.length} credit{actor.filmography.length === 1 ? '' : 's'} in index
         </p>
       </div>
     </Link>

@@ -4,7 +4,7 @@ import { HttpError } from '../middleware/errorHandler';
 import { createMovie, getMovieById, patchMovie, searchMovies } from '../services/movies.service';
 import { scrapeImdbMovie } from '../services/imdbScrape.service';
 import { upsertActorForMovie } from '../services/actors.service';
-import { CastMember } from '../types/movie';
+import { Credit } from '../types/movie';
 
 function parsePaging(req: Request) {
   const page = Math.max(1, Number(req.query.page) || 1);
@@ -38,10 +38,10 @@ export const addMovieFromImdbUrl = asyncHandler(async (req: Request, res: Respon
     throw new HttpError(409, `Movie already indexed: ${existing.title}`);
   }
 
-  const cast: CastMember[] = [];
+  const credits: Credit[] = [];
   for (const actor of scraped.actors) {
-    const linked = await upsertActorForMovie(actor.name, { movieId: scraped.id, title: scraped.title });
-    cast.push({ actorId: linked.id, name: linked.name });
+    const linked = await upsertActorForMovie(actor.name, { titleId: scraped.id, title: scraped.title, category: 'actor' });
+    credits.push({ personId: linked.id, name: linked.name, category: 'actor' });
   }
 
   const movie = await createMovie({
@@ -55,7 +55,7 @@ export const addMovieFromImdbUrl = asyncHandler(async (req: Request, res: Respon
     description: scraped.description,
     imdbUrl: scraped.imdbUrl,
     posterUrl: scraped.posterUrl,
-    cast,
+    credits,
   });
 
   res.status(201).json(movie);
