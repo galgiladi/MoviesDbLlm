@@ -1,111 +1,111 @@
 # AI Chat "Smart Search" on the Movies Page
 
-Status: implemented.
+Status: implemented (tool-calling design, v2 — see History below for the superseded v1).
 
 ## Context
 
 The Movies page (`client/src/pages/MoviesPage.tsx`) only supports lexical keyword search (`multi_match` over
 `title`/`description`/`genres`, see `server/src/services/movies.service.ts`). It can't answer analytical
 natural-language questions like *"who was the busiest actor in the last 10 years"* because that requires
-reasoning across the nested `cast` field, not a text match. This feature adds an "Ask AI" chat panel to the
-Movies page where the user asks free-form questions and gets a grounded, streamed answer that cites the actual
-movies/actors it's based on (clickable references, not hallucinated text).
+reasoning across credits/filmography, not a text match. This feature adds an "Ask AI" chat panel to the Movies
+page where the user asks free-form questions and gets a grounded, streamed answer that cites the actual
+movies/people it's based on (clickable references, not hallucinated text).
 
 Decisions made along the way:
-- **LLM**: Anthropic Claude.
-- **UI placement**: an embedded panel/toggle on the existing `MoviesPage`, not a separate route.
-- **Response mode**: streamed (SSE) so text appears progressively like a real chat.
-- **Conversation scope**: stateless — one question in, one answer out, no multi-turn history for v1.
-- **Data-access approach**: an earlier design gave Claude a tool to author its own Elasticsearch query DSL at
-  answer time. That was rejected as too risky (script-injection/DoS surface from letting a model author live
-  query DSL). At the time this was designed, the dataset was small enough (1000 movies) to stuff the entire
-  index into context; the safer design is **context stuffing**: the server runs one fixed, hardcoded query it
-  wrote itself (a plain `match_all` fetch of the `titles` index — never a model-authored query), trims it to
-  relevant fields, and hands that as ground-truth context to Claude. Claude then computes answers (counts,
-  "most appearances," filters by year/genre, etc.) purely by reasoning over the data it was given. **Claude
-  never sends a query to Elasticsearch itself** — eliminating the entire class of injection/DoS risk that came
-  with letting the model author arbitrary query DSL against a live cluster. This trades that risk for token
-  cost, mitigated with Anthropic prompt caching.
-  **Since then, the seed pipeline was scaled up to 100,000 movies** (see [PLAN.md § Phase
-  2](PLAN.md#phase-2--scaling-up-current)), which no longer fits in context — `moviesContext.service.ts` was
-  left fetching only the first `MAX_MOVIES = 20` as a stopgap rather than redesigned, so Ask AI currently
-  reasons over a small, arbitrary slice of the catalog, not the whole thing. Making it work at full scale needs
-  real retrieval (tool-based lookups instead of stuffing), which is intentionally not part of this doc's design
-  — see the "Known follow-ups" note in [CLAUDE.md](../CLAUDE.md).
+- **LLM**: Groq (free tier, fast inference), not Anthropic — a deliberate switch away from Claude/paid APIs.
+  Model is configurable via `GROQ_MODEL` (default `llama-3.3-70b-versatile`).
+- **UI placement**: unchanged — an embedded panel/toggle on the existing `MoviesPage`, not a separate route.
+- **Response mode**: unchanged — streamed (SSE) so text appears progressively like a real chat.
+- **Conversation scope**: unchanged — stateless, one question in, one answer out, no multi-turn history.
+- **Data-access approach**: **real tool-calling against Elasticsearch**, replacing the original "stuff the
+  whole index into context" design (see History). The model is given four fixed, backend-defined tools — never
+  a passthrough for model-authored query DSL, so the injection/DoS risk that motivated the original design
+  never comes back:
+  - `search_titles(query?, genre?, yearFrom?, yearTo?, limit?)` — ranked movie search
+  - `get_title_details(id)` — full details + credits for one movie
+  - `get_person_filmography(name, limit?)` — look up a person, return their filmography with roles
+  - `aggregate_titles_by(metric, yearFrom?, yearTo?, limit?)` — genre-level aggregation (count/avgScore/avgNumVotes)
+
+  Each tool hardcodes its own ES query shape (`server/src/services/chat/tools.ts`); the model only ever supplies
+  the tool's declared arguments (a search string, a genre, a year range, an id), never a query body.
 
 ## Architecture
 
-**Context-stuffed single-turn completion, server-side.** The client POSTs the question to `/api/chat`. The
-server:
+**Two-phase tool-calling loop, server-side.** The client POSTs the question to `/api/chat`; the server:
 
-1. Builds (or reuses a cached) **trimmed data context**: one `match_all`-style fetch of (only the first
-   `MAX_MOVIES` = 20 of) the `titles` index, mapped down to only the fields useful for reasoning: `id, title,
-   year, genres, description, score, numVotes, credits: [{personId, name, category}]`. Dropped: `imdbUrl`,
-   `posterUrl`, `runtimeMinutes`, `createdAt`, `updatedAt`, and each credit's `character` — not needed to answer
-   questions, only used by detail pages the UI already has. The `people` index is not fetched separately —
-   `titles.credits` already contains every person/movie relationship needed.
-2. Sends Claude a system prompt containing that context block (marked for Anthropic prompt caching), today's
-   date (so "recent 10 years" resolves correctly), and instructions to answer only from the given data and
-   ground every claim in it.
-3. Sends the user's question as the user message, and streams Claude's response via SSE.
-4. Claude's reply ends with a required **structured `answer` tool call**: `{ references: [{ type: 'movie' |
-   'actor', id: string, title: string }] }`. The visible answer text is accumulated server-side from the
-   streamed text deltas rather than repeated inside the tool call. Because the only data Claude has is the
-   context block itself, every `id`/`title` it cites necessarily comes from that block.
-5. The server streams: text deltas live as SSE `token` events, then a terminal SSE `final` event carrying
-   `{ text, references }`, then closes the stream.
+1. **Phase 1 — gather + answer** (`streamChatAnswer` in `server/src/services/chat.service.ts`): loops up to
+   `MAX_TOOL_ITERATIONS` (6) times, each time streaming one Groq chat-completion turn with the four data tools
+   available (`tool_choice: 'auto'`). Any text the model writes during the loop (including interim commentary
+   like "let me check that") is forwarded live as SSE `token` events — this is a deliberate choice: it keeps
+   the UX simple (the frontend just concatenates every token event into one growing answer) and is a common,
+   transparent pattern for tool-calling chat. When the model requests tool calls, each is executed via
+   `executeDataTool` and the JSON result is appended back as a `role: 'tool'` message; the loop continues until
+   the model responds with plain text and no further tool calls (or the iteration cap is hit).
+2. **Phase 2 — structured citations**: once the loop has a final answer, one more **non-streaming** Groq call
+   is made with only the `answer` tool available, `tool_choice` forced to it, asking the model to enumerate
+   every movie/person its already-written answer cited. This mirrors the original design's "answer tool call
+   is for citations only, not for the visible text" split — the answer text was already fully streamed in
+   phase 1, so this call only needs to return `{ references: [{ type, id, title }] }`. A failure here (e.g. a
+   transient Groq error) doesn't fail the whole response — it just means no reference chips render.
+3. The server streams: text deltas live as SSE `token` events throughout phase 1, then a terminal SSE `final`
+   event carrying `{ text, references }` once phase 2 resolves, then closes the stream.
 
-No tool-based data retrieval loop is used — this is simpler than a typical RAG/agentic setup precisely because
-the whole corpus already fits in context. The only "tool" Claude has is the terminal `answer` call, used to get
-structured, parseable output instead of free-form prose.
-
-**Prompt caching for cost/freshness.** Resending ~1.27MB of trimmed JSON on every question would be slow and
-expensive without mitigation:
-- `server/src/services/moviesContext.service.ts` builds the trimmed context block and caches it in memory with
-  a short TTL (5 minutes).
-- The block is also marked with Anthropic's native prompt-caching directive (`cache_control: { type:
-  'ephemeral' }`) on the system prompt content block, so repeated questions within the cache window reuse
-  Claude-side cached input tokens instead of reprocessing the full context every time.
-- The in-memory cache is invalidated whenever `createMovie` or `patchMovie` runs (`movies.service.ts`), so
-  newly added movies or edited scores show up in chat answers promptly. This only works because the dataset is
-  small; it would need to become real retrieval again if the catalog grew to a much larger scale — a known,
-  explicit limitation of this choice.
+Streaming and tool-calling are combined using the standard OpenAI-compatible chunk-delta accumulation pattern
+(Groq's SDK mirrors this exactly): each streamed chunk's `delta.tool_calls[]` carries an `index` used to
+accumulate that specific tool call's `id`/`name`/fragmented JSON `arguments` string across chunks, since a
+single tool call's arguments can arrive split across many chunks.
 
 ## Key files
 
-- `server/src/services/moviesContext.service.ts` — trimmed/cached context builder (the one fixed ES query)
-- `server/src/services/chat.service.ts` — builds the Claude request, streams tokens + final structured answer
-- `server/src/services/movies.service.ts` — calls `invalidateMoviesContext()` in `createMovie`/`patchMovie`
+- `server/src/services/chat/tools.ts` — the four data-tool JSON-schema definitions + their ES-backed
+  implementations (the entire data-access boundary; no other code path lets the model reach Elasticsearch)
+- `server/src/services/chat.service.ts` — the two-phase Groq loop described above, plus the `answer` tool
+  definition and system prompt
 - `server/src/controllers/chat.controller.ts`, `server/src/routes/chat.routes.ts` — SSE endpoint (`POST
-  /api/chat`), mounted in `server/src/app.ts`
-- `client/src/api/chat.ts` — SSE client helper (manual `fetch` + stream parsing, since `EventSource` doesn't
-  support POST bodies)
-- `client/src/components/AiSearchPanel.tsx` — chat UI (toggle, input, streamed answer, reference chips linking
-  to `/movies/:id` / `/actors/:id`)
-- `client/src/pages/MoviesPage.tsx` — "Ask AI" toggle wiring
-- `client/src/index.css` — `.ai-panel` / `.ai-reference-chip` styles, reusing existing CSS custom properties
+  /api/chat`), mounted in `server/src/app.ts` — **unchanged** from v1
+- `client/src/api/chat.ts`, `client/src/components/AiSearchPanel.tsx`, `client/src/pages/MoviesPage.tsx`,
+  `client/src/index.css` (`.ai-panel`/`.ai-reference-chip`) — **entirely unchanged**; the SSE event contract
+  (`token`/`final`/`error`) didn't change, so no client code needed to change for this redesign
 
 ## Config
 
-Requires `ANTHROPIC_API_KEY` (and optionally `ANTHROPIC_MODEL`, default `claude-sonnet-5`) in `server/.env` —
-see `server/.env.example`.
+Requires `GROQ_API_KEY` (get a free key at [console.groq.com](https://console.groq.com)) and optionally
+`GROQ_MODEL` (default `llama-3.3-70b-versatile`) in `server/.env` — see `server/.env.example`.
 
 ## Verification
 
-1. `npm run es:up` then `npm run seed` (if not already seeded) to ensure the `movies` index has real IMDb data
-   with populated `cast`/`year` fields.
-2. Add `ANTHROPIC_API_KEY` to `server/.env`.
+1. `npm run es:up` then `npm run seed` (if not already seeded) to ensure the `titles`/`people` indices have
+   real IMDb data.
+2. Add `GROQ_API_KEY` to `server/.env`.
 3. `npm run dev` (root) to start client + server together.
 4. `curl -N -X POST http://localhost:4000/api/chat -H "Content-Type: application/json" -d
-   "{\"question\":\"who was the busiest actor in the last 10 years\"}"` and confirm SSE frames stream, ending
-   in a `final` event with non-empty, plausible `references`.
+   "{\"question\":\"recommend 3 comedies from after 2010\"}"` and confirm SSE frames stream, ending in a
+   `final` event with non-empty, plausible `references`.
 5. In the browser, open the Movies page, click "Ask AI", ask the same question, and confirm: text streams in
    progressively, reference chips render below the answer, and clicking a chip navigates to the correct
    `/movies/:id` or `/actors/:id` page with matching data.
-6. Try a different analytical question (e.g. "what genre has the highest average score?") and a simple
-   descriptive one (e.g. "movies about time travel from the 90s") to confirm both reasoning styles work from
-   context alone.
-7. Add a new movie via "Add Movie", then ask a question that should include it — confirm it shows up once
-   `invalidateMoviesContext()` has cleared the cache.
-8. Try a nonsense question to confirm Claude returns a coherent "I don't know" via the `answer` tool rather
-   than hallucinating references.
+6. Try a question needing a specific person lookup (e.g. "what has Christopher Nolan directed?") to exercise
+   `get_person_filmography`, and an aggregation question (e.g. "which genre has the highest average score?")
+   to exercise `aggregate_titles_by`.
+7. Try a nonsense question to confirm the model returns a coherent "I don't know" rather than hallucinating
+   references.
+
+## Known limitation
+
+`people.filmography` entries don't carry the title's `genres`/`year` (an explicit, documented tradeoff from
+the Phase 2 indexing work — see `docs/PLAN.md`), so a query like "which actor appeared in a musical, an
+action movie, and a comedy all in the same year" would require the model to chain `get_person_filmography` +
+several `get_title_details` calls per candidate and reason over the results itself — doable, but not a single
+efficient tool call today. Denormalizing genre/year onto filmography entries (or adding a dedicated
+cross-reference tool) is the natural follow-up if this class of question turns out to matter in practice.
+
+## History (superseded v1 design)
+
+The original implementation (when the dataset was capped at ~1,000 movies) used **context stuffing** instead
+of tool-calling: the server ran one fixed `match_all` query, trimmed the entire index down to essential fields,
+and handed it to Claude as context — Claude reasoned over the given data with no retrieval loop at all, using
+Anthropic prompt caching to keep repeated-question costs down. That stopped scaling once the seed pipeline was
+raised to 100,000 movies (an entire-index dump no longer fits in a prompt), and was left running against only
+the first 20 movies as a stopgap (`moviesContext.service.ts`, now deleted) until this tool-calling redesign
+replaced it entirely, together with the switch to Groq. Nothing from `moviesContext.service.ts` carries over —
+retrieval is now real per-question ES queries via the tools above, not a cached, capped snapshot.

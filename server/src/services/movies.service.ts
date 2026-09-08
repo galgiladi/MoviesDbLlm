@@ -1,7 +1,6 @@
 import { esClient } from '../es/client';
 import { TITLES_INDEX } from '../es/indices';
 import { Movie, MovieInput } from '../types/movie';
-import { invalidateMoviesContext } from './moviesContext.service';
 
 export interface SearchMoviesParams {
   q?: string;
@@ -17,6 +16,10 @@ export interface SearchResult<T> {
 }
 
 export async function searchMovies({ q, page, size }: SearchMoviesParams): Promise<SearchResult<Movie>> {
+  // Text match only decides *which* movies match; ranking is always by popularity (numVotes),
+  // same as the no-query listing, so well-known movies surface first everywhere in the app —
+  // a pure relevance (_score) sort could otherwise put an obscure exact title match above a far
+  // more famous partial match (e.g. "Batman" outranking "Batman Begins").
   const query = q && q.trim()
     ? {
         multi_match: {
@@ -32,7 +35,7 @@ export async function searchMovies({ q, page, size }: SearchMoviesParams): Promi
     query,
     from: (page - 1) * size,
     size,
-    sort: q && q.trim() ? ['_score'] : [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
+    sort: [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
   });
 
   const total = typeof result.hits.total === 'number'
@@ -66,7 +69,6 @@ export async function createMovie(movie: MovieInput): Promise<Movie> {
     document: doc,
     refresh: 'wait_for',
   });
-  invalidateMoviesContext();
   return doc;
 }
 
@@ -81,7 +83,6 @@ export async function patchMovie(id: string, partial: Partial<Movie>): Promise<M
     doc: update,
     refresh: 'wait_for',
   });
-  invalidateMoviesContext();
 
   return { ...existing, ...update };
 }

@@ -81,7 +81,7 @@ This runs the API on `http://localhost:4000` and the client on `http://localhost
 - `GET /api/actors/:id` — includes `filmography`, each entry tagged with its role
   (`actor`/`actress`/`director`/`writer`/`producer`)
 - `POST /api/chat { question }` — AI chat search (SSE); see [docs/ai-chat-search.md](docs/ai-chat-search.md).
-  Requires `ANTHROPIC_API_KEY` in `server/.env`.
+  Requires `GROQ_API_KEY` in `server/.env` (free key at [console.groq.com](https://console.groq.com)).
 
 ## Notes
 

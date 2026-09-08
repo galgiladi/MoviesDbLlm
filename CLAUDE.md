@@ -2,8 +2,9 @@
 
 A demo app: React + TypeScript client, Node/Express + TypeScript API, Elasticsearch as the datastore. Indexes
 up to ~100,000 real movies (title/year/genres/rating + actor, actress, director, writer, and producer credits)
-from IMDb's official bulk datasets, with server-side search, an "Ask AI" panel backed by Claude, inline score
-editing, and adding new movies by pasting an IMDb URL.
+from IMDb's official bulk datasets, with server-side search (ranked by popularity), an "Ask AI" panel backed
+by Groq (tool-calling over the real ES data, not a stuffed context), inline score editing, and adding new
+movies by pasting an IMDb URL.
 
 See [README.md](README.md) for setup/run steps. The original design plan lives in [docs/PLAN.md](docs/PLAN.md)
 — its Phase 1 section is still accurate for the search/scrape pieces; § Phase 2 covers the scale-up and index
@@ -37,15 +38,14 @@ at the repo root, via `concurrently`).
     `<script type="application/ld+json">` block (far more stable than scraping DOM/CSS classes) for
     title/description/rating/genres/actor names. Only ever produces `category: 'actor'` credits (the scraped
     page doesn't distinguish roles or give stable IMDb `nconst`s).
-  - `chat.service.ts` + `moviesContext.service.ts` — the **Ask AI** feature (added after the original plan):
-    streams a Claude answer (via `@anthropic-ai/sdk`, model from `ANTHROPIC_MODEL`) grounded only in the
-    current movie data. `moviesContext.service.ts` builds/caches a JSON context block from ES (5 min TTL,
-    invalidated on movie create/update) and Claude is instructed to cite only movies/actors from that block,
-    reporting citations via a forced tool call (`answer`) so the UI can render clickable reference chips.
-    **Note:** `MAX_MOVIES` in `moviesContext.service.ts` is still hardcoded to 20 (a leftover smoke-test cap
-    from before the index could hold 100,000 movies) — context-stuffing the *entire* index stops being viable
-    at this scale, so raising this number meaningfully requires the tool-based retrieval redesign mentioned
-    below, not just a bigger constant.
+  - `chat.service.ts` + `chat/tools.ts` — the **Ask AI** feature: a two-phase Groq (`groq-sdk`, model from
+    `GROQ_MODEL`) tool-calling loop. Phase 1 streams turns where the model can call four fixed, ES-backed data
+    tools (`search_titles`, `get_title_details`, `get_person_filmography`, `aggregate_titles_by` — defined in
+    `chat/tools.ts`, the entire data-access boundary; the model never gets raw query DSL) until it produces a
+    final text answer with no more tool calls; phase 2 forces one more `answer` tool call (no data tools
+    offered) purely to extract `{ references }` for the UI's clickable chips. See
+    [docs/ai-chat-search.md](docs/ai-chat-search.md) for the full design and why it replaced an earlier
+    context-stuffing version that stopped scaling once the index passed ~1,000 movies.
 - `src/controllers/` + `src/routes/`: `movies`, `actors`, `chat` — thin REST/SSE layer over the services.
 - `src/scripts/seed/`: one-time seed pipeline (`npm run seed`, from `server/`):
   1. `download.ts` — downloads IMDb's public dataset files into `data/.cache/` (skips existing files).
@@ -92,15 +92,16 @@ each entry's role). `api/` holds typed fetch wrappers (`client.ts` reads `VITE_A
 - Every credit/filmography entry carries a `category` (`actor | actress | director | writer | producer`); UI
   code that only wants cast should filter on `category === 'actor' || category === 'actress'` (see
   `MovieDetailPage.tsx`) rather than assuming every entry is an actor.
-- Any code path that changes movie data must call `invalidateMoviesContext()` (see `movies.service.ts`) so
-  Ask AI doesn't answer from a stale cached context.
+- Ask AI no longer caches or invalidates anything (no more `moviesContext.service.ts`) — every question runs
+  real ES queries via the tools in `chat/tools.ts`, so new/edited movies show up immediately, not on a TTL.
 - `server/.env` and `client/.env` are gitignored; `.env.example` in each documents the required vars
-  (`ANTHROPIC_API_KEY` is required for Ask AI to work).
+  (`GROQ_API_KEY` is required for Ask AI to work — free key at console.groq.com).
 
 ## Known follow-ups (not started)
 
-- **Ask AI at scale**: the context-stuffing approach only works because it currently caps at 20 movies; a real
-  redesign (tool-based retrieval instead of stuffing the whole index) is needed before it can reason over the
-  full 100,000-movie catalog. Deliberately out of scope for this pass.
+- **Cross-genre/year person queries**: a query like "actor in a musical, action movie, and comedy all in the
+  same year" isn't a single efficient tool call today, since `people.filmography` entries don't carry the
+  title's genre/year (see `docs/PLAN.md`) — the model would have to chain several `get_title_details` calls
+  and reason over the results itself. Documented in `docs/ai-chat-search.md`'s "Known limitation".
 - **Plot summaries**: deferred, would need a TMDb (or similar) enrichment step per movie.
 - **tvSeries / videoGame titles**: explicitly out of scope for now; the pipeline only indexes `titleType=movie`.
