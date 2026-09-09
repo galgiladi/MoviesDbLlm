@@ -11,10 +11,12 @@
     "seed:build": "ts-node src/scripts/seed/buildSeed.ts",
     "seed:index": "ts-node src/scripts/seed/indexSeed.ts",
     "seed": "npm run seed:download && npm run seed:build && npm run seed:index",
-    "enrich:plots": "ts-node src/scripts/enrich/plots.ts"
+    "enrich:plots": "ts-node src/scripts/enrich/plots.ts",
+    "enrich:embeddings": "ts-node src/scripts/enrich/embedPlots.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.15.0",
+    "@huggingface/transformers": "^4.2.0",
     "axios": "^1.7.7",
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
@@ -29,5 +31,8 @@
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.5.4"
+  },
+  "overrides": {
+    "onnxruntime-node": "1.19.0"
   }
 }

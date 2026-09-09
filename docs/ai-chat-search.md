@@ -23,12 +23,14 @@ Decisions made along the way:
   long silent "Thinking..." during multi-tool-call questions.
 - **Conversation scope**: unchanged — stateless, one question in, one answer out, no multi-turn history.
 - **Data-access approach**: **real tool-calling against Elasticsearch**, replacing the original "stuff the
-  whole index into context" design (see History). The model is given five fixed, backend-defined tools — never
-  a passthrough for model-authored query DSL, so the injection/DoS risk that motivated the original design
-  never comes back:
+  whole index into context" design (see History). This is RAG in the general sense (retrieve, then generate
+  grounded in what came back) — it has been since this redesign, not something new added with plot summaries.
+  The model is given six fixed, backend-defined tools — never a passthrough for model-authored query DSL, so
+  the injection/DoS risk that motivated the original design never comes back:
   - `search_titles(query?, genre?, yearFrom?, yearTo?, limit?)` — ranked movie search; returns
     `{ total, items }` so "how many X movies are there" questions can be answered from the accurate total count,
-    not just the trimmed `items` list
+    not just the trimmed `items` list. **Lexical** (keyword) matching only — see the semantic tool below for
+    the gap this leaves.
   - `get_title_details(id)` — full details + credits for one movie
   - `get_person_filmography(name, limit?)` — look up a person, return their filmography with roles
   - `aggregate_titles_by(metric, yearFrom?, yearTo?, limit?)` — genre-level aggregation (count/avgScore/avgNumVotes)
@@ -36,6 +38,10 @@ Decisions made along the way:
     often in movies of a given genre (optionally filtered to one role) — added specifically to answer
     "recommend a/an `<role>` who does `<genre>` movies" in one call instead of the model manually
     cross-referencing many individual `get_title_details` calls
+  - `semantic_search_plots(query, limit?)` — **semantic** (embedding/kNN) search over `plotEmbedding`, for
+    questions describing a theme/premise rather than a title/genre/year (e.g. "a widower finding love again"),
+    where lexical matching in `search_titles` would miss a plot with the same meaning but different wording.
+    See "Semantic search" below for the full design.
 
   Each tool hardcodes its own ES query shape (`server/src/services/chat/tools.ts`); the model only ever supplies
   the tool's declared arguments (a search string, a genre, a year range, an id), never a query body.
@@ -113,6 +119,41 @@ A hard per-call deadline (`PER_CALL_TIMEOUT_MS`, 30s, via `AbortSignal.timeout()
 Groq call — the client's own `timeout` option was observed to not cover a stream that goes silent mid-flight
 (a stalled stream produced zero chunks for 60s+ with no error before this was added).
 
+## Semantic search (plot embeddings)
+
+Added once real plot summaries existed (see `docs/PLAN.md`'s plot-summary note) — before that, there was no
+real content to search semantically. Elasticsearch does have a built-in one-click semantic field
+(`semantic_text`), but it's **Enterprise-license only**; the free/Basic tier this project runs on (no auth,
+`docker-compose.yml`) only includes the lower-level building block — `dense_vector` field + kNN search, where
+*we* generate the embedding vectors ourselves and ES just indexes/searches them (confirmed against Elastic's
+own docs before building this, not assumed).
+
+- **Embedding model**: local, not a hosted API — `@huggingface/transformers` running `Xenova/all-MiniLM-L6-v2`
+  in-process (`server/src/services/embeddings.ts`), 384 dims, ~30ms/embedding on CPU. Deliberately not a free
+  hosted embedding API: unlike the one-time TMDb backfill, embeddings are also needed on the *live* path (every
+  user question needs embedding at ask-time), and this project has already been burned repeatedly by free-tier
+  rate limits (Groq) — a rate-limited embedding API would just move that problem onto the search path too.
+- **Intel Mac gotcha**: `onnxruntime-node` (the native runtime `@huggingface/transformers` uses) dropped the
+  `darwin-x64` binary in current versions — only `darwin-arm64` (Apple Silicon) ships now. `server/package.json`
+  pins it back via `overrides.onnxruntime-node: "1.19.0"`, the last version confirmed to still include it.
+  Without this override, loading the pipeline throws `Cannot find module '.../onnxruntime_binding.node'` on
+  this kind of machine. Same pattern as the Docker Desktop / Playwright Intel-Mac issues earlier in this
+  project — verified directly (installed, hit the missing-binary error, found the override) rather than
+  assumed.
+- **Mapping**: `titles.plotEmbedding` — `{ type: 'dense_vector', dims: 384, index: true, similarity: 'cosine' }`
+  (`server/src/es/indices.ts`). Added to the mapping *after* the index already had 100k docs — `ensureIndex()`
+  now calls `indices.putMapping()` on an already-existing index (ES allows adding new fields, just not changing
+  existing ones), so this didn't require a full reindex.
+- **Backfill pipeline** (two separate resumable scripts, run in order): `npm run enrich:plots` (TMDb plot
+  summaries) → `npm run enrich:embeddings` (embeds them). The embedding script skips any movie still on the
+  templated description (reconstructs the exact template string to detect this) — nothing meaningful to embed
+  there, and embedding a generic templated sentence would just pollute semantic search results with
+  near-duplicate noise across every movie of the same genre.
+- **The tool**: `semantic_search_plots(query, limit?)` embeds the query the same way and runs an ES `knn`
+  search against `plotEmbedding`. It only ever finds movies that got a real embedding — a miss doesn't mean
+  the movie isn't in the catalog, just that it has no indexed plot to match against (surfaced in the tool's own
+  description so the model doesn't over-conclude from an empty result).
+
 ## Config
 
 Requires `GROQ_API_KEY` (get a free key at [console.groq.com](https://console.groq.com)) and optionally
@@ -137,9 +178,13 @@ free-tier models change over time; if the configured model starts returning `mod
    exercise `aggregate_titles_by`, a count question (e.g. "how many batman movies are there?") to exercise
    `search_titles`'s `total`, and a recommendation question (e.g. "recommend an actress who does action
    movies") to exercise `find_people_by_genre`.
-7. Try a nonsense question to confirm the model returns a coherent "I don't know" rather than hallucinating
+7. Run `npm run enrich:plots` then `npm run enrich:embeddings` (no `TMDB_API_KEY` needed for the latter — fully
+   local), then try a plot/theme question with wording that wouldn't lexically match the actual plot text (e.g.
+   "a widower finding love again") to confirm `semantic_search_plots` gets used and returns a sensible match —
+   this is the one that wouldn't have worked via `search_titles` alone.
+8. Try a nonsense question to confirm the model returns a coherent "I don't know" rather than hallucinating
    references.
-8. Confirm the answer renders as actual formatted Markdown (bold, tables, lists) in the panel, not literal
+9. Confirm the answer renders as actual formatted Markdown (bold, tables, lists) in the panel, not literal
    `**`/`|`/`-` characters, and that it reads naturally with no mention of "the database" or "search results".
 
 **Status as of the last session**: items 1-3 and the raw `curl` check in item 4 were verified directly against
@@ -149,6 +194,15 @@ with an accurate `total`; `find_people_by_genre` returns genuine, recognizable a
 browser UI) was **not visually confirmed** — testing was blocked by Groq's free-tier daily token limit
 (200,000 TPD) being exhausted from the session's own testing before a clean screenshot could be captured.
 Worth a real look before relying on it.
+
+**Semantic search (item 7)**: `semantic_search_plots`'s ES-layer logic was verified directly (bypassing the
+LLM) with genuinely on-theme results for "a widower finding love again" and "a heist that goes wrong" — real
+semantic matches, not keyword coincidences. The model reliably picks this tool over `search_titles` for
+thematic questions (confirmed via the `status` event each time). A full live round-trip through Groq was
+**not cleanly confirmed** — both attempts hit the same tokens-per-minute ceiling documented under "Reliability
+notes" above (this question needs 3-4 tool calls, and my own repeated testing in the same short window used up
+the shared budget). This isn't a new problem specific to this tool; it's the same pre-existing tension. Worth
+retrying fresh (i.e. not right after other heavy testing) before concluding either way.
 
 ## Known limitation
 

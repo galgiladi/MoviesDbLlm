@@ -59,6 +59,8 @@ function describeToolCall(name: string, args: Record<string, unknown>): string {
       const genre = typeof args.genre === 'string' && args.genre ? args.genre : 'that genre';
       return `Finding notable names in ${genre}…`;
     }
+    case 'semantic_search_plots':
+      return 'Looking for movies with a similar plot…';
     default:
       return 'Looking that up…';
   }
@@ -104,6 +106,11 @@ function buildSystemPrompt(): string {
     'to famous facts you already know (e.g. who a well-known character is): if it did not come from a tool',
     'result, do not say it. Combine tools as needed — e.g. search_titles then get_title_details on a result, or',
     'find_people_by_genre to recommend someone known for a given genre.',
+    '',
+    'search_titles matches title/genre/exact words only. When the question describes a plot, theme, or premise',
+    '("a movie about...", "something like X but...", a mood or setting) rather than naming a title/genre/year,',
+    'use semantic_search_plots instead — it matches by meaning. It only covers movies with an indexed plot',
+    "summary, so a miss there doesn't mean the movie isn't in the catalog at all.",
     '',
     'Your tools only cover movies and the real people credited on them (actors, directors, writers, producers)',
     "— they know nothing about fictional characters as such (backstory, powers, comics lore, etc.). If a",

@@ -3,6 +3,7 @@ import { esClient } from '../../es/client';
 import { TITLES_INDEX, PEOPLE_INDEX } from '../../es/indices';
 import { Movie } from '../../types/movie';
 import { Actor } from '../../types/actor';
+import { embedText } from '../embeddings';
 
 /**
  * Every tool the model can call is a small, hardcoded ES query — never a passthrough for
@@ -215,6 +216,29 @@ const findPeopleByGenre: ToolExecutor = async (args) => {
   }));
 };
 
+const semanticSearchPlots: ToolExecutor = async (args) => {
+  const query = asString(args.query);
+  if (!query) return { error: 'query is required' };
+  const limit = clampLimit(args.limit, 6, 10);
+
+  const vector = await embedText(query);
+
+  const result = await esClient.search<Movie>({
+    index: TITLES_INDEX,
+    knn: {
+      field: 'plotEmbedding',
+      query_vector: vector,
+      k: limit,
+      num_candidates: Math.max(limit * 10, 50),
+    },
+  } as any);
+
+  return result.hits.hits.map((hit) => {
+    const m = hit._source as Movie;
+    return { id: m.id, title: m.title, year: m.year, genres: m.genres, score: m.score, numVotes: m.numVotes };
+  });
+};
+
 export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
@@ -317,6 +341,26 @@ export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'semantic_search_plots',
+      description:
+        'Find movies by what happens in them, their theme, or premise — matched by meaning, not exact ' +
+        'keywords (e.g. "a widower finding love again", "heist that goes wrong", "kids on a magical ' +
+        'adventure"). Use this instead of search_titles when the question describes a plot/theme rather ' +
+        'than a specific title, genre, or year. Only finds movies that have a real plot summary indexed — ' +
+        'a miss here does not mean the movie is not in the catalog, just that it has no summary to match.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'A description of the plot, theme, or premise to search for.' },
+          limit: { type: ['integer', 'null'], description: 'Max results to return (default 6, max 10).' },
+        },
+        required: ['query'],
+      },
+    },
+  },
 ];
 
 const EXECUTORS: Record<string, ToolExecutor> = {
@@ -325,6 +369,7 @@ const EXECUTORS: Record<string, ToolExecutor> = {
   get_person_filmography: getPersonFilmography,
   aggregate_titles_by: aggregateTitlesBy,
   find_people_by_genre: findPeopleByGenre,
+  semantic_search_plots: semanticSearchPlots,
 };
 
 export async function executeDataTool(name: string, args: Record<string, unknown>): Promise<unknown> {

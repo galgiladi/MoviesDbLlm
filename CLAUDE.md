@@ -40,15 +40,22 @@ at the repo root, via `concurrently`).
     page doesn't distinguish roles or give stable IMDb `nconst`s).
   - `chat.service.ts` + `chat/tools.ts` — the **Ask AI** feature: a two-phase Groq (`groq-sdk`, model from
     `GROQ_MODEL`, default `openai/gpt-oss-120b`) tool-calling loop. Phase 1 streams turns where the model can
-    call five fixed, ES-backed data tools (`search_titles`, `get_title_details`, `get_person_filmography`,
-    `aggregate_titles_by`, `find_people_by_genre` — defined in `chat/tools.ts`, the entire data-access boundary;
-    the model never gets raw query DSL) until it produces a final text answer with no more tool calls, also
-    streaming a `status` SSE event before each tool call so the UI shows real progress; phase 2 forces one more
-    `answer` tool call (no data tools offered) purely to extract `{ references }` for the UI's clickable chips.
-    The system prompt requires natural, Markdown-formatted answers with no mention of "the database"/tools —
-    the client renders it with `react-markdown` + `remark-gfm`. See
+    call six fixed, ES-backed data tools (`search_titles`, `get_title_details`, `get_person_filmography`,
+    `aggregate_titles_by`, `find_people_by_genre`, `semantic_search_plots` — defined in `chat/tools.ts`, the
+    entire data-access boundary; the model never gets raw query DSL) until it produces a final text answer with
+    no more tool calls, also streaming a `status` SSE event before each tool call so the UI shows real progress;
+    phase 2 forces one more `answer` tool call (no data tools offered) purely to extract `{ references }` for
+    the UI's clickable chips. The system prompt requires natural, Markdown-formatted answers with no mention of
+    "the database"/tools — the client renders it with `react-markdown` + `remark-gfm`. See
     [docs/ai-chat-search.md](docs/ai-chat-search.md) for the full design and why it replaced an earlier
     context-stuffing version that stopped scaling once the index passed ~1,000 movies.
+  - `embeddings.ts` — local (CPU, no API key, no rate limits) text embeddings via
+    `@huggingface/transformers` running `Xenova/all-MiniLM-L6-v2` in-process (384 dims). Backs both the
+    one-time `enrich:embeddings` backfill and `semantic_search_plots`'s live query embedding. **Important**:
+    `server/package.json` pins `overrides.onnxruntime-node` to `1.19.0` — newer versions dropped the native
+    binary for `darwin-x64` (Intel Mac) entirely; without the override, loading the pipeline fails with
+    `Cannot find module '.../onnxruntime_binding.node'` on this kind of machine. Don't remove the override
+    without confirming darwin-x64 support is back.
 - `src/controllers/` + `src/routes/`: `movies`, `actors`, `chat` — thin REST/SSE layer over the services.
 - `src/scripts/seed/`: one-time seed pipeline (`npm run seed`, from `server/`):
   1. `download.ts` — downloads IMDb's public dataset files into `data/.cache/` (skips existing files).
@@ -69,7 +76,13 @@ at the repo root, via `concurrently`).
   `posterUrl` from TMDb's poster if present) wherever a match is found; movies TMDb doesn't have keep the
   templated description. Progress is persisted to `data/.cache/tmdb-plot-progress.json`, so it's safe to
   Ctrl+C and re-run later — already-attempted tconsts aren't retried. Requires `TMDB_API_KEY` (free key from
-  themoviedb.org); concurrency is capped at 8 to stay under TMDb's free-tier rate limit.
+  themoviedb.org); concurrency is capped at 8 to stay under TMDb's free-tier rate limit. Run this before
+  `enrich:embeddings` (below) — the embedding pass has nothing meaningful to embed until real plots exist.
+- `src/scripts/enrich/embedPlots.ts` (`npm run enrich:embeddings`): resumable pass that computes a local
+  embedding (`services/embeddings.ts`) of each movie's real plot summary and writes it to the `plotEmbedding`
+  field, skipping movies still on the templated description (reconstructs the exact template string to detect
+  this — nothing meaningful to embed there). Progress persisted to
+  `data/.cache/plot-embedding-progress.json`. No API key needed (fully local); ~30ms/movie on CPU.
 
 ### API surface
 
@@ -106,7 +119,8 @@ each entry's role). `api/` holds typed fetch wrappers (`client.ts` reads `VITE_A
   real ES queries via the tools in `chat/tools.ts`, so new/edited movies show up immediately, not on a TTL.
 - `server/.env` and `client/.env` are gitignored; `.env.example` in each documents the required vars
   (`GROQ_API_KEY` is required for Ask AI to work — free key at console.groq.com; `TMDB_API_KEY` is required for
-  `npm run enrich:plots` — free key at themoviedb.org).
+  `npm run enrich:plots` — free key at themoviedb.org). `enrich:embeddings` and `semantic_search_plots` need no
+  API key — the embedding model runs locally.
 
 ## Known follow-ups (not started)
 

@@ -18,6 +18,10 @@ const titlesMapping = {
     score: { type: 'float' },
     numVotes: { type: 'integer' },
     description: { type: 'text' },
+    // Embedding of `description` (only when it's a real TMDb plot, not the templated fallback) -
+    // powers semantic_search_plots. 384 dims to match the Xenova/all-MiniLM-L6-v2 model in
+    // services/embeddings.ts; `index: true` + cosine similarity enables approximate kNN search.
+    plotEmbedding: { type: 'dense_vector', dims: 384, index: true, similarity: 'cosine' },
     imdbUrl: { type: 'keyword' },
     posterUrl: { type: 'keyword' },
     credits: {
@@ -53,10 +57,17 @@ const peopleMapping = {
 
 async function ensureIndex(index: string, mappings: Record<string, unknown>) {
   const exists = await esClient.indices.exists({ index });
-  if (exists) return;
-  await esClient.indices.create({ index, mappings });
-  // eslint-disable-next-line no-console
-  console.log(`Created index "${index}"`);
+  if (!exists) {
+    await esClient.indices.create({ index, mappings });
+    // eslint-disable-next-line no-console
+    console.log(`Created index "${index}"`);
+    return;
+  }
+  // Index already exists (e.g. from before plotEmbedding was added) - ES allows adding new
+  // fields to an existing mapping (though not changing existing ones), so patch it in rather
+  // than requiring a full reindex.
+  const { properties } = mappings as { properties: Record<string, unknown> };
+  await esClient.indices.putMapping({ index, properties: properties as any });
 }
 
 export async function ensureIndices() {
