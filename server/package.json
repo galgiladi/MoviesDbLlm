@@ -10,7 +10,8 @@
     "seed:download": "ts-node src/scripts/seed/download.ts",
     "seed:build": "ts-node src/scripts/seed/buildSeed.ts",
     "seed:index": "ts-node src/scripts/seed/indexSeed.ts",
-    "seed": "npm run seed:download && npm run seed:build && npm run seed:index"
+    "seed": "npm run seed:download && npm run seed:build && npm run seed:index",
+    "enrich:plots": "ts-node src/scripts/enrich/plots.ts"
   },
   "dependencies": {
     "@elastic/elasticsearch": "^8.15.0",

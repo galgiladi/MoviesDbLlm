@@ -132,12 +132,14 @@ for the up-to-date file-by-file summary.
 - **Roles**: expand beyond actors-only to **actor, actress, director, writer, producer** (all pulled from
   `title.principals`, which already carries these categories for top-billed credits — no need to add
   `title.crew.tsv` as a separate download for this pass).
-- **Plot summaries**: explicitly **deferred**. IMDb's bulk datasets have zero plot/description field anywhere
-  (`title.basics` only has `tconst, titleType, primaryTitle, originalTitle, isAdult, startYear, endYear,
-  runtimeMinutes, genres`). The only free source of real plot text is scraping each IMDb title page's `ld+json`
-  block (what `imdbScrape.service.ts` already does for the single-URL "Add Movie" flow) — not viable in bulk for
-  100k movies. Seeded movies keep the current templated description; real plot text (via TMDb API) stays a
-  future enrichment step, added without needing to redo this phase.
+- **Plot summaries**: deferred in this phase, since implemented separately afterward. IMDb's bulk datasets have
+  zero plot/description field anywhere (`title.basics` only has `tconst, titleType, primaryTitle,
+  originalTitle, isAdult, startYear, endYear, runtimeMinutes, genres`), and scraping each IMDb page's `ld+json`
+  block (what `imdbScrape.service.ts` does for the single-URL "Add Movie" flow) isn't viable in bulk for 100k
+  movies. Real plot text is now a separate resumable enrichment pass against TMDb
+  (`server/src/scripts/enrich/plots.ts`, `npm run enrich:plots`) that updates the already-indexed `titles` docs
+  directly — see [CLAUDE.md](../CLAUDE.md) for details. Movies TMDb doesn't have keep the templated
+  description from this phase as a fallback.
 - **Index naming**: rename `movies` → `titles` and `actors` → `people` now, ahead of actually needing the
   broader scope (tvSeries/videoGame, more roles) — avoids a rename/migration later. HTTP route paths
   (`/api/movies`, `/api/actors`) stay as-is for this pass to minimize client churn; only the Elasticsearch index

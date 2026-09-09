@@ -8,4 +8,5 @@ export const env = {
   clientOrigin: process.env.CLIENT_ORIGIN ?? 'http://localhost:5173',
   groqApiKey: process.env.GROQ_API_KEY ?? '',
   groqModel: process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b',
+  tmdbApiKey: process.env.TMDB_API_KEY ?? '',
 };

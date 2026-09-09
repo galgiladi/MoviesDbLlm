@@ -63,6 +63,13 @@ at the repo root, via `concurrently`).
   `docker compose up` before it accepts connections). At 100,000 movies, `seed:build`'s two full scans of
   `title.principals.tsv.gz` and `name.basics.tsv.gz` (both tens of millions of rows) are the slow steps —
   runtime is dominated by those linear file scans, not by the movie count itself.
+- `src/scripts/enrich/plots.ts` (`npm run enrich:plots`): resumable pass that backfills real plot summaries
+  from TMDb (`GET /3/find/{imdbId}?external_source=imdb_id`, one call per movie) directly onto the
+  already-indexed `titles` docs — replaces the templated description with TMDb's `overview` (and sets
+  `posterUrl` from TMDb's poster if present) wherever a match is found; movies TMDb doesn't have keep the
+  templated description. Progress is persisted to `data/.cache/tmdb-plot-progress.json`, so it's safe to
+  Ctrl+C and re-run later — already-attempted tconsts aren't retried. Requires `TMDB_API_KEY` (free key from
+  themoviedb.org); concurrency is capped at 8 to stay under TMDb's free-tier rate limit.
 
 ### API surface
 
@@ -98,7 +105,8 @@ each entry's role). `api/` holds typed fetch wrappers (`client.ts` reads `VITE_A
 - Ask AI no longer caches or invalidates anything (no more `moviesContext.service.ts`) — every question runs
   real ES queries via the tools in `chat/tools.ts`, so new/edited movies show up immediately, not on a TTL.
 - `server/.env` and `client/.env` are gitignored; `.env.example` in each documents the required vars
-  (`GROQ_API_KEY` is required for Ask AI to work — free key at console.groq.com).
+  (`GROQ_API_KEY` is required for Ask AI to work — free key at console.groq.com; `TMDB_API_KEY` is required for
+  `npm run enrich:plots` — free key at themoviedb.org).
 
 ## Known follow-ups (not started)
 
@@ -106,5 +114,8 @@ each entry's role). `api/` holds typed fetch wrappers (`client.ts` reads `VITE_A
   same year" isn't a single efficient tool call today, since `people.filmography` entries don't carry the
   title's genre/year (see `docs/PLAN.md`) — the model would have to chain several `get_title_details` calls
   and reason over the results itself. Documented in `docs/ai-chat-search.md`'s "Known limitation".
-- **Plot summaries**: deferred, would need a TMDb (or similar) enrichment step per movie.
+- **`find_people_by_genre` tool design**: added to answer "recommend a/an `<role>` for `<genre>` movies", but
+  flagged as the wrong general shape — a bespoke tool per question pattern doesn't scale. Should be merged
+  with `aggregate_titles_by` into one general aggregation tool (group by genre *or* by person+role) before
+  adding more capabilities in this family; not done yet, left as one tool for now.
 - **tvSeries / videoGame titles**: explicitly out of scope for now; the pipeline only indexes `titleType=movie`.

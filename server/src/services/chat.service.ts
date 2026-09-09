@@ -130,11 +130,17 @@ function isRetryable(err: unknown): boolean {
 /** Groq's free tier has a small tokens-per-minute budget (observed: 8000 TPM), easily exhausted
  * by a single multi-tool-call question. The 429 body includes "Please try again in N.NNs" —
  * retrying immediately just re-hits the same still-exhausted window, so parse that hint (falling
- * back to a fixed delay if the message shape ever changes) and actually wait for it. */
+ * back to a fixed delay if the message shape ever changes) and actually wait for it. Capped hard:
+ * the *daily* token limit uses the same message shape but can suggest waits of several minutes,
+ * which is never acceptable in a synchronous chat request — past the cap we just give up instead
+ * of blocking the response for that long (see the overall deadline in streamChatAnswer). */
+const MAX_RATE_LIMIT_WAIT_MS = 8_000;
+
 function rateLimitWaitMs(err: InstanceType<typeof Groq.RateLimitError>): number {
   const match = /try again in ([\d.]+)s/i.exec(err.message);
   const seconds = match ? Number(match[1]) : 6;
-  return Math.ceil((Number.isFinite(seconds) ? seconds : 6) * 1000) + 250;
+  const ms = Math.ceil((Number.isFinite(seconds) ? seconds : 6) * 1000) + 250;
+  return Math.min(ms, MAX_RATE_LIMIT_WAIT_MS);
 }
 
 /** Retries on a timeout/abort or a transient (rate-limit/connection/5xx) error — rate limits get
@@ -142,8 +148,10 @@ function rateLimitWaitMs(err: InstanceType<typeof Groq.RateLimitError>): number 
  * sub-second to a few seconds, since a single multi-tool-call question can bump into the free
  * tier's small tokens-per-minute budget more than once on its own); everything else gets one
  * retry. A genuine bad-request/schema error is rethrown immediately rather than wasting an
- * attempt on a call that will just fail the same way again. */
-async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+ * attempt on a call that will just fail the same way again. `deadlineAt` bounds the *total* time
+ * spent here (including waits) so this can never itself blow past the overall response deadline —
+ * once it's passed, whatever error we have is rethrown immediately instead of waiting/retrying. */
+async function withRetry<T>(fn: () => Promise<T>, deadlineAt: number): Promise<T> {
   const maxAttempts = 3;
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -153,10 +161,12 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
       lastErr = err;
       if (!isRetryable(err)) throw err;
       if (attempt === maxAttempts - 1) break;
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) break;
       // Only rate limits carry a meaningful "try again in Xs" hint worth waiting out; other
       // transient errors (timeout/connection/5xx) aren't on a fixed cooldown, so retry right away.
       if (err instanceof Groq.RateLimitError) {
-        await new Promise((resolve) => setTimeout(resolve, rateLimitWaitMs(err)));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(rateLimitWaitMs(err), remaining)));
       }
     }
   }
@@ -169,10 +179,13 @@ async function streamTurn(
   tools: Groq.Chat.Completions.ChatCompletionTool[],
   toolChoice: Groq.Chat.Completions.ChatCompletionToolChoiceOption,
   onToken: (text: string) => void,
+  deadlineAt: number,
 ): Promise<{ content: string; toolCalls: { id: string; name: string; args: string }[] }> {
   // The client's own `timeout` option appears to only guard until the response starts, not a
   // stream that goes silent mid-flight (observed: a stalled stream produced zero chunks for 60s+
   // with no error) — so enforce a hard deadline covering the whole call via AbortSignal instead.
+  // Shrinks as the overall deadline approaches, so a single call can't eat the whole budget.
+  const callTimeoutMs = Math.max(1_000, Math.min(PER_CALL_TIMEOUT_MS, deadlineAt - Date.now()));
   const stream = await groq.chat.completions.create(
     {
       model: env.groqModel,
@@ -181,7 +194,7 @@ async function streamTurn(
       tool_choice: toolChoice,
       stream: true,
     },
-    { signal: AbortSignal.timeout(PER_CALL_TIMEOUT_MS) },
+    { signal: AbortSignal.timeout(callTimeoutMs) },
   );
 
   let content = '';
@@ -220,19 +233,46 @@ function safeParseArgs(raw: string): Record<string, unknown> {
   }
 }
 
+// Hard ceiling on phase 1's total wall-clock time, independent of how many iterations/retries
+// that involves — so a question that keeps hitting rate limits, or one where the model just
+// can't find the right tool combination, still resolves in a reasonable time instead of the sum
+// of several 30s-timeout-plus-retries iterations stretching out to minutes.
+const OVERALL_DEADLINE_MS = 45_000;
+
+const FALLBACK_NO_INFO = "I wasn't able to find enough information to answer that.";
+const FALLBACK_ERROR = "Sorry, I ran into a problem finding an answer to that — please try asking again in a moment.";
+
 export async function streamChatAnswer(question: string, handlers: StreamChatAnswerHandlers): Promise<void> {
+  try {
+    await runChatLoop(question, handlers);
+  } catch (err) {
+    // Whatever went wrong (exhausted retries, an unexpected Groq error, ...), the user should
+    // still get a calm, in-character answer rather than a raw technical failure — a graceful
+    // "couldn't find it" beats a red error box every time.
+    // eslint-disable-next-line no-console
+    console.error('Ask AI failed:', err);
+    handlers.onFinal({ text: FALLBACK_ERROR, references: [] });
+  }
+}
+
+async function runChatLoop(question: string, handlers: StreamChatAnswerHandlers): Promise<void> {
   const messages: Message[] = [
     { role: 'system', content: buildSystemPrompt() },
     { role: 'user', content: question },
   ];
 
   let finalText = '';
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + OVERALL_DEADLINE_MS;
 
   // Phase 1: let the model call data tools as needed, streaming any text it writes along the
   // way (including interim commentary), until it responds with plain text and no tool calls.
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-    const { content, toolCalls } = await withRetry(() =>
-      streamTurn(messages, DATA_TOOL_DEFINITIONS, 'auto', handlers.onToken),
+    if (Date.now() >= deadlineAt) break;
+
+    const { content, toolCalls } = await withRetry(
+      () => streamTurn(messages, DATA_TOOL_DEFINITIONS, 'auto', handlers.onToken, deadlineAt),
+      deadlineAt,
     );
     finalText += content;
 
@@ -258,28 +298,28 @@ export async function streamChatAnswer(question: string, handlers: StreamChatAns
 
   finalText = finalText.trim();
   if (!finalText) {
-    handlers.onFinal({ text: "I wasn't able to find enough information to answer that.", references: [] });
+    handlers.onFinal({ text: FALLBACK_NO_INFO, references: [] });
     return;
   }
 
   // Phase 2: force a structured `answer` tool call (no further data tools offered) purely to
   // extract citations for the UI — the visible answer text itself was already streamed above.
+  // References are a nice-to-have, so this is deliberately best-effort: one attempt, no retry —
+  // it's not worth adding latency to a working answer just to chase citation chips.
   messages.push({ role: 'assistant', content: finalText });
   messages.push({ role: 'user', content: 'Now call the answer tool listing every movie/person you cited.' });
 
   let references: ChatReference[] = [];
   try {
-    const response = await withRetry(() =>
-      groq.chat.completions.create(
-        {
-          model: env.groqModel,
-          messages,
-          tools: [ANSWER_TOOL],
-          tool_choice: { type: 'function', function: { name: ANSWER_TOOL_NAME } },
-          stream: false,
-        },
-        { signal: AbortSignal.timeout(PER_CALL_TIMEOUT_MS) },
-      ),
+    const response = await groq.chat.completions.create(
+      {
+        model: env.groqModel,
+        messages,
+        tools: [ANSWER_TOOL],
+        tool_choice: { type: 'function', function: { name: ANSWER_TOOL_NAME } },
+        stream: false,
+      },
+      { signal: AbortSignal.timeout(PER_CALL_TIMEOUT_MS) },
     );
 
     const toolCall = response.choices[0]?.message.tool_calls?.[0];
@@ -288,7 +328,6 @@ export async function streamChatAnswer(question: string, handlers: StreamChatAns
       references = Array.isArray(parsed.references) ? parsed.references : [];
     }
   } catch {
-    // References are a nice-to-have for the UI; don't fail the whole answer if this call errors.
     references = [];
   }
 
