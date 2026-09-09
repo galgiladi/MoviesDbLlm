@@ -17,6 +17,10 @@ function asString(value: unknown): string | undefined {
 }
 
 function asInt(value: unknown): number | undefined {
+  // Number(null) is 0, not NaN — the model can legitimately send `null` for an unset optional
+  // field (Groq's tool-call schema requires it to be an allowed type), so that must be treated
+  // the same as "absent", not coerced into a real 0.
+  if (value === null || value === undefined) return undefined;
   const n = Number(value);
   return Number.isFinite(n) ? Math.trunc(n) : undefined;
 }
@@ -32,7 +36,11 @@ const searchTitles: ToolExecutor = async (args) => {
   const genre = asString(args.genre);
   const yearFrom = asInt(args.yearFrom);
   const yearTo = asInt(args.yearTo);
-  const limit = clampLimit(args.limit, 10, 25);
+  // Kept deliberately small — every tool result gets echoed back into the conversation history
+  // for every subsequent call in the loop, so oversized results compound quickly against the
+  // free tier's tight tokens-per-minute budget (observed: 8000 TPM, easily exhausted by a
+  // single multi-turn question).
+  const limit = clampLimit(args.limit, 6, 10);
 
   const filter: Record<string, unknown>[] = [];
   if (genre) filter.push({ term: { genres: genre } });
@@ -40,8 +48,13 @@ const searchTitles: ToolExecutor = async (args) => {
     filter.push({ range: { year: { gte: yearFrom, lte: yearTo } } });
   }
 
+  // operator: 'and' matters a lot here: with the default 'or', a multi-word query like
+  // "Spider-Man" tokenizes to ["spider", "man"], and "man" alone is common enough to match tons
+  // of unrelated movies (Iron Man, ...) — which, combined with sorting by popularity, let famous
+  // unrelated blockbusters swamp the real matches. 'and' requires every term to actually appear
+  // (fuzzy-matched, so minor typos are still fine) before a document counts as a hit at all.
   const must = query
-    ? [{ multi_match: { query, fields: ['title^3', 'description', 'genres'], fuzziness: 'AUTO' } }]
+    ? [{ multi_match: { query, fields: ['title^3', 'description', 'genres'], operator: 'and' as const, fuzziness: 'AUTO' } }]
     : [{ match_all: {} }];
 
   const result = await esClient.search<Movie>({
@@ -51,10 +64,15 @@ const searchTitles: ToolExecutor = async (args) => {
     sort: [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
   });
 
-  return result.hits.hits.map((hit) => {
-    const m = hit._source as Movie;
-    return { id: m.id, title: m.title, year: m.year, genres: m.genres, score: m.score, numVotes: m.numVotes };
-  });
+  const total = typeof result.hits.total === 'number' ? result.hits.total : result.hits.total?.value ?? 0;
+
+  return {
+    total,
+    items: result.hits.hits.map((hit) => {
+      const m = hit._source as Movie;
+      return { id: m.id, title: m.title, year: m.year, genres: m.genres, score: m.score, numVotes: m.numVotes };
+    }),
+  };
 };
 
 const getTitleDetails: ToolExecutor = async (args) => {
@@ -86,7 +104,7 @@ const getTitleDetails: ToolExecutor = async (args) => {
 const getPersonFilmography: ToolExecutor = async (args) => {
   const name = asString(args.name);
   if (!name) return { error: 'name is required' };
-  const limit = clampLimit(args.limit, 25, 100);
+  const limit = clampLimit(args.limit, 10, 20);
 
   const result = await esClient.search<Actor>({
     index: PEOPLE_INDEX,
@@ -151,23 +169,70 @@ const aggregateTitlesBy: ToolExecutor = async (args) => {
   return rows.slice(0, limit);
 };
 
+const findPeopleByGenre: ToolExecutor = async (args) => {
+  const genre = asString(args.genre);
+  if (!genre) return { error: 'genre is required' };
+  const category = asString(args.category);
+  const limit = clampLimit(args.limit, 10, 20);
+
+  const result = await esClient.search<Movie>({
+    index: TITLES_INDEX,
+    query: { term: { genres: genre } },
+    size: 0,
+    aggs: {
+      credits: {
+        nested: { path: 'credits' },
+        aggs: {
+          matching: {
+            filter: category ? { term: { 'credits.category': category } } : { match_all: {} },
+            aggs: {
+              by_person: {
+                terms: { field: 'credits.personId', size: limit },
+                aggs: {
+                  name: { terms: { field: 'credits.name.keyword', size: 1 } },
+                  category: { terms: { field: 'credits.category', size: 1 } },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  } as any);
+
+  const buckets = ((result as any).aggregations?.credits?.matching?.by_person?.buckets ?? []) as Array<{
+    key: string;
+    doc_count: number;
+    name: { buckets: { key: string }[] };
+    category: { buckets: { key: string }[] };
+  }>;
+
+  return buckets.map((b) => ({
+    personId: b.key,
+    name: b.name.buckets[0]?.key ?? b.key,
+    category: b.category.buckets[0]?.key,
+    movieCount: b.doc_count,
+  }));
+};
+
 export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
       name: 'search_titles',
       description:
-        'Search movies by free-text query and/or filter by genre and year range. Returns a ranked list of ' +
-        'matching movies (most well-known first) with basic info. Use this to find candidate movies before ' +
-        'looking up full details with get_title_details.',
+        'Search movies by free-text query and/or filter by genre and year range. Returns { total, items }: ' +
+        '"total" is the full count of matching movies (use this for "how many X movies are there" questions), ' +
+        '"items" is a ranked list of the most well-known matches with basic info. Use this to find candidate ' +
+        'movies before looking up full details with get_title_details.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Free-text search over title/description (optional).' },
-          genre: { type: 'string', description: 'Filter to movies with this exact genre, e.g. "Comedy" (optional).' },
-          yearFrom: { type: 'integer', description: 'Only movies released in this year or later (optional).' },
-          yearTo: { type: 'integer', description: 'Only movies released in this year or earlier (optional).' },
-          limit: { type: 'integer', description: 'Max results to return (default 10, max 25).' },
+          query: { type: ['string', 'null'], description: 'Free-text search over title/description (optional).' },
+          genre: { type: ['string', 'null'], description: 'Filter to movies with this exact genre, e.g. "Comedy" (optional).' },
+          yearFrom: { type: ['integer', 'null'], description: 'Only movies released in this year or later (optional).' },
+          yearTo: { type: ['integer', 'null'], description: 'Only movies released in this year or earlier (optional).' },
+          limit: { type: ['integer', 'null'], description: 'Max results to return (default 10, max 25).' },
         },
         required: [],
       },
@@ -200,7 +265,7 @@ export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
         type: 'object',
         properties: {
           name: { type: 'string', description: "The person's name to look up." },
-          limit: { type: 'integer', description: 'Max filmography entries to return (default 25, max 100).' },
+          limit: { type: ['integer', 'null'], description: 'Max filmography entries to return (default 25, max 100).' },
         },
         required: ['name'],
       },
@@ -221,11 +286,34 @@ export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
             enum: ['count', 'avgScore', 'avgNumVotes'],
             description: 'What to rank genres by.',
           },
-          yearFrom: { type: 'integer', description: 'Only consider movies released in this year or later (optional).' },
-          yearTo: { type: 'integer', description: 'Only consider movies released in this year or earlier (optional).' },
-          limit: { type: 'integer', description: 'Max genres to return, sorted by metric descending (default 10).' },
+          yearFrom: { type: ['integer', 'null'], description: 'Only consider movies released in this year or later (optional).' },
+          yearTo: { type: ['integer', 'null'], description: 'Only consider movies released in this year or earlier (optional).' },
+          limit: { type: ['integer', 'null'], description: 'Max genres to return, sorted by metric descending (default 10).' },
         },
         required: ['metric'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'find_people_by_genre',
+      description:
+        'Find which people appear most often in movies of a given genre, optionally restricted to one role ' +
+        '(actor, actress, director, writer, or producer). Use this for "recommend a/an <role> who does ' +
+        '<genre> movies" style questions instead of manually cross-referencing many individual movies.',
+      parameters: {
+        type: 'object',
+        properties: {
+          genre: { type: 'string', description: 'Genre to filter by, e.g. "Action".' },
+          category: {
+            type: ['string', 'null'],
+            enum: ['actor', 'actress', 'director', 'writer', 'producer', null],
+            description: 'Optional: restrict to one credit role.',
+          },
+          limit: { type: ['integer', 'null'], description: 'Max people to return, sorted by movie count descending (default 10, max 20).' },
+        },
+        required: ['genre'],
       },
     },
   },
@@ -236,6 +324,7 @@ const EXECUTORS: Record<string, ToolExecutor> = {
   get_title_details: getTitleDetails,
   get_person_filmography: getPersonFilmography,
   aggregate_titles_by: aggregateTitlesBy,
+  find_people_by_genre: findPeopleByGenre,
 };
 
 export async function executeDataTool(name: string, args: Record<string, unknown>): Promise<unknown> {

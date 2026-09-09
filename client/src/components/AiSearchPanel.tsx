@@ -1,10 +1,13 @@
 import { FormEvent, useState } from 'react';
 import { Link } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { ChatReference, streamChatAnswer } from '../api/chat';
 
 export function AiSearchPanel() {
   const [question, setQuestion] = useState('');
   const [answerText, setAnswerText] = useState('');
+  const [status, setStatus] = useState('');
   const [references, setReferences] = useState<ChatReference[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -17,17 +20,24 @@ export function AiSearchPanel() {
     setLoading(true);
     setError(null);
     setAnswerText('');
+    setStatus('');
     setReferences([]);
 
     streamChatAnswer(trimmed, {
-      onToken: (text) => setAnswerText((prev) => prev + text),
+      onToken: (text) => {
+        setStatus('');
+        setAnswerText((prev) => prev + text);
+      },
+      onStatus: (text) => setStatus(text),
       onFinal: (answer) => {
         setAnswerText(answer.text);
+        setStatus('');
         setReferences(answer.references);
         setLoading(false);
       },
       onError: (message) => {
         setError(message);
+        setStatus('');
         setLoading(false);
       },
     });
@@ -52,7 +62,13 @@ export function AiSearchPanel() {
 
       {(answerText || loading) && !error && (
         <div className="ai-panel-answer">
-          <p>{answerText || <span className="muted">Thinking...</span>}</p>
+          {answerText ? (
+            <div className="ai-panel-markdown">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{answerText}</ReactMarkdown>
+            </div>
+          ) : (
+            <p className="muted">{status || 'Thinking...'}</p>
+          )}
 
           {references.length > 0 && (
             <div className="tag-row">

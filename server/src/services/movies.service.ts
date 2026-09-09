@@ -20,11 +20,17 @@ export async function searchMovies({ q, page, size }: SearchMoviesParams): Promi
   // same as the no-query listing, so well-known movies surface first everywhere in the app —
   // a pure relevance (_score) sort could otherwise put an obscure exact title match above a far
   // more famous partial match (e.g. "Batman" outranking "Batman Begins").
+  // operator: 'and' matters here: with the default 'or', a multi-word query like "Spider-Man"
+  // tokenizes to ["spider", "man"], and "man" alone is common enough to match tons of unrelated
+  // movies (Iron Man, ...) — which, combined with sorting by popularity above, let famous
+  // unrelated blockbusters swamp the real matches. 'and' requires every term to actually appear
+  // (still fuzzy-matched, so minor typos are fine) before a document counts as a hit at all.
   const query = q && q.trim()
     ? {
         multi_match: {
           query: q.trim(),
           fields: ['title^3', 'description', 'genres'],
+          operator: 'and' as const,
           fuzziness: 'AUTO',
         },
       }

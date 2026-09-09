@@ -13,34 +13,60 @@ movies/people it's based on (clickable references, not hallucinated text).
 
 Decisions made along the way:
 - **LLM**: Groq (free tier, fast inference), not Anthropic — a deliberate switch away from Claude/paid APIs.
-  Model is configurable via `GROQ_MODEL` (default `llama-3.3-70b-versatile`).
+  Model is configurable via `GROQ_MODEL`, default `openai/gpt-oss-120b` (the originally-configured
+  `llama-3.3-70b-versatile` turned out to have been moved to enterprise-only access on Groq's side — verified
+  directly against the API with a real key; `gpt-oss-120b` was confirmed to work on the free tier, including
+  streaming + tool calls).
 - **UI placement**: unchanged — an embedded panel/toggle on the existing `MoviesPage`, not a separate route.
-- **Response mode**: unchanged — streamed (SSE) so text appears progressively like a real chat.
+- **Response mode**: streamed (SSE) so text appears progressively; also streams a lightweight `status` event
+  (e.g. "Searching for ...") while a tool call is in flight, so the panel shows real-time progress instead of a
+  long silent "Thinking..." during multi-tool-call questions.
 - **Conversation scope**: unchanged — stateless, one question in, one answer out, no multi-turn history.
 - **Data-access approach**: **real tool-calling against Elasticsearch**, replacing the original "stuff the
-  whole index into context" design (see History). The model is given four fixed, backend-defined tools — never
+  whole index into context" design (see History). The model is given five fixed, backend-defined tools — never
   a passthrough for model-authored query DSL, so the injection/DoS risk that motivated the original design
   never comes back:
-  - `search_titles(query?, genre?, yearFrom?, yearTo?, limit?)` — ranked movie search
+  - `search_titles(query?, genre?, yearFrom?, yearTo?, limit?)` — ranked movie search; returns
+    `{ total, items }` so "how many X movies are there" questions can be answered from the accurate total count,
+    not just the trimmed `items` list
   - `get_title_details(id)` — full details + credits for one movie
   - `get_person_filmography(name, limit?)` — look up a person, return their filmography with roles
   - `aggregate_titles_by(metric, yearFrom?, yearTo?, limit?)` — genre-level aggregation (count/avgScore/avgNumVotes)
+  - `find_people_by_genre(genre, category?, limit?)` — nested aggregation that finds which people appear most
+    often in movies of a given genre (optionally filtered to one role) — added specifically to answer
+    "recommend a/an `<role>` who does `<genre>` movies" in one call instead of the model manually
+    cross-referencing many individual `get_title_details` calls
 
   Each tool hardcodes its own ES query shape (`server/src/services/chat/tools.ts`); the model only ever supplies
   the tool's declared arguments (a search string, a genre, a year range, an id), never a query body.
+
+- **Search relevance**: `search_titles`'s `multi_match` uses `operator: 'and'` (not the default `'or'`) — a
+  real bug found and fixed after testing: with `'or'`, a multi-word query like "Spider-Man" tokenizes to
+  ["spider", "man"], and "man" alone is common enough to match tons of unrelated movies (Iron Man, ...), which
+  combined with sorting by popularity let famous unrelated blockbusters swamp genuinely relevant results
+  (confirmed via a debug trace: searching "Spider-Man" returned *Iron Man*, *Mad Max*, *Catch Me If You Can*).
+  `'and'` requires every query term to actually appear (still fuzzy-matched, so minor typos are fine) before a
+  document counts as a hit at all.
+- **Answer tone/format**: the system prompt explicitly instructs the model to write like a knowledgeable friend
+  recommending films — never mentioning "the database", "search results", "tool calls", or other implementation
+  detail — and to format the answer in Markdown (tables/bold/lists). The client renders it with `react-markdown`
+  + `remark-gfm` (`AiSearchPanel.tsx`) instead of plain text.
 
 ## Architecture
 
 **Two-phase tool-calling loop, server-side.** The client POSTs the question to `/api/chat`; the server:
 
 1. **Phase 1 — gather + answer** (`streamChatAnswer` in `server/src/services/chat.service.ts`): loops up to
-   `MAX_TOOL_ITERATIONS` (6) times, each time streaming one Groq chat-completion turn with the four data tools
+   `MAX_TOOL_ITERATIONS` (6) times, each time streaming one Groq chat-completion turn with the five data tools
    available (`tool_choice: 'auto'`). Any text the model writes during the loop (including interim commentary
    like "let me check that") is forwarded live as SSE `token` events — this is a deliberate choice: it keeps
    the UX simple (the frontend just concatenates every token event into one growing answer) and is a common,
-   transparent pattern for tool-calling chat. When the model requests tool calls, each is executed via
-   `executeDataTool` and the JSON result is appended back as a `role: 'tool'` message; the loop continues until
-   the model responds with plain text and no further tool calls (or the iteration cap is hit).
+   transparent pattern for tool-calling chat. Right before each tool executes, a short human-readable SSE
+   `status` event fires (`describeToolCall()` — e.g. "Searching for \"Spider-Man\"…", "Looking up Christopher
+   Nolan's filmography…") so the panel shows real progress instead of long silence during multi-call questions;
+   the frontend clears the status line the moment real answer tokens start arriving. Each requested tool call is
+   executed via `executeDataTool` and the JSON result is appended back as a `role: 'tool'` message; the loop
+   continues until the model responds with plain text and no further tool calls (or the iteration cap is hit).
 2. **Phase 2 — structured citations**: once the loop has a final answer, one more **non-streaming** Groq call
    is made with only the `answer` tool available, `tool_choice` forced to it, asking the model to enumerate
    every movie/person its already-written answer cited. This mirrors the original design's "answer tool call
@@ -57,20 +83,42 @@ single tool call's arguments can arrive split across many chunks.
 
 ## Key files
 
-- `server/src/services/chat/tools.ts` — the four data-tool JSON-schema definitions + their ES-backed
+- `server/src/services/chat/tools.ts` — the five data-tool JSON-schema definitions + their ES-backed
   implementations (the entire data-access boundary; no other code path lets the model reach Elasticsearch)
-- `server/src/services/chat.service.ts` — the two-phase Groq loop described above, plus the `answer` tool
-  definition and system prompt
-- `server/src/controllers/chat.controller.ts`, `server/src/routes/chat.routes.ts` — SSE endpoint (`POST
-  /api/chat`), mounted in `server/src/app.ts` — **unchanged** from v1
-- `client/src/api/chat.ts`, `client/src/components/AiSearchPanel.tsx`, `client/src/pages/MoviesPage.tsx`,
-  `client/src/index.css` (`.ai-panel`/`.ai-reference-chip`) — **entirely unchanged**; the SSE event contract
-  (`token`/`final`/`error`) didn't change, so no client code needed to change for this redesign
+- `server/src/services/chat.service.ts` — the two-phase Groq loop described above, the `answer` tool
+  definition, the system prompt, `describeToolCall()` (status-line text), and the retry/timeout handling below
+- `server/src/controllers/chat.controller.ts` — SSE endpoint (`POST /api/chat`), now also forwards `onStatus`
+  as a `status` SSE event; `server/src/routes/chat.routes.ts` unchanged
+- `client/src/api/chat.ts` — parses the new `status` SSE event in addition to `token`/`final`/`error`
+- `client/src/components/AiSearchPanel.tsx` — shows the status line while waiting, and renders the final answer
+  with `react-markdown` + `remark-gfm` instead of plain text
+- `client/src/index.css` — `.ai-panel-markdown` styles (tables/lists/code) for the rendered answer
+
+## Reliability notes (Groq free tier)
+
+Two separate rate-limit dimensions were hit and handled during testing, both surfaced as HTTP 429
+`RateLimitError` with a `"Please try again in N.NNs"` hint in the message:
+- **Tokens-per-minute (observed: 8000 TPM)** — easily exhausted by a single multi-tool-call question, since
+  every tool result gets echoed back into the growing conversation for every subsequent call in the loop.
+  `withRetry()` in `chat.service.ts` parses the wait hint and actually waits it out (up to 3 attempts) instead
+  of retrying immediately into the same still-exhausted window. Tool result sizes were also trimmed down
+  (`search_titles` capped to 6-10 items, `get_person_filmography` to 10-20) specifically to reduce how much
+  each call adds to the running total.
+- **Tokens-per-day (observed: 200,000 TPD)** — a much harder wall with a much slower recovery (a rolling
+  window, not a fixed midnight reset); heavy back-to-back testing can exhaust it for hours. There's no code-side
+  mitigation for this one — it's a hard free-tier ceiling. If Ask AI starts reliably failing after working
+  fine earlier, check for this specifically (the server logs the raw Groq error) before assuming a regression.
+
+A hard per-call deadline (`PER_CALL_TIMEOUT_MS`, 30s, via `AbortSignal.timeout()`) is also enforced on every
+Groq call — the client's own `timeout` option was observed to not cover a stream that goes silent mid-flight
+(a stalled stream produced zero chunks for 60s+ with no error before this was added).
 
 ## Config
 
 Requires `GROQ_API_KEY` (get a free key at [console.groq.com](https://console.groq.com)) and optionally
-`GROQ_MODEL` (default `llama-3.3-70b-versatile`) in `server/.env` — see `server/.env.example`.
+`GROQ_MODEL` (default `openai/gpt-oss-120b`) in `server/.env` — see `server/.env.example`. Groq's available
+free-tier models change over time; if the configured model starts returning `model_not_found`, check
+`GET https://api.groq.com/openai/v1/models` with your key for what's currently accessible.
 
 ## Verification
 
@@ -85,10 +133,22 @@ Requires `GROQ_API_KEY` (get a free key at [console.groq.com](https://console.gr
    progressively, reference chips render below the answer, and clicking a chip navigates to the correct
    `/movies/:id` or `/actors/:id` page with matching data.
 6. Try a question needing a specific person lookup (e.g. "what has Christopher Nolan directed?") to exercise
-   `get_person_filmography`, and an aggregation question (e.g. "which genre has the highest average score?")
-   to exercise `aggregate_titles_by`.
+   `get_person_filmography`, an aggregation question (e.g. "which genre has the highest average score?") to
+   exercise `aggregate_titles_by`, a count question (e.g. "how many batman movies are there?") to exercise
+   `search_titles`'s `total`, and a recommendation question (e.g. "recommend an actress who does action
+   movies") to exercise `find_people_by_genre`.
 7. Try a nonsense question to confirm the model returns a coherent "I don't know" rather than hallucinating
    references.
+8. Confirm the answer renders as actual formatted Markdown (bold, tables, lists) in the panel, not literal
+   `**`/`|`/`-` characters, and that it reads naturally with no mention of "the database" or "search results".
+
+**Status as of the last session**: items 1-3 and the raw `curl` check in item 4 were verified directly against
+Elasticsearch/the API (confirmed: `search_titles("batman")` now correctly returns only real Batman movies
+with an accurate `total`; `find_people_by_genre` returns genuine, recognizable action actresses; one full
+`curl` round-trip produced a well-formatted, natural-sounding Markdown answer). Item 5 (the actual rendered
+browser UI) was **not visually confirmed** — testing was blocked by Groq's free-tier daily token limit
+(200,000 TPD) being exhausted from the session's own testing before a clean screenshot could be captured.
+Worth a real look before relying on it.
 
 ## Known limitation
 

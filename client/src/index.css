@@ -481,6 +481,41 @@ input[type='number'] {
   line-height: 1.6;
 }
 
+.ai-panel-markdown p {
+  margin: 0 0 10px;
+}
+
+.ai-panel-markdown ul,
+.ai-panel-markdown ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.ai-panel-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 14px;
+  font-size: 0.92rem;
+}
+
+.ai-panel-markdown th,
+.ai-panel-markdown td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+.ai-panel-markdown th {
+  background: var(--surface-hover);
+}
+
+.ai-panel-markdown code {
+  background: var(--surface-hover);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+}
+
 .ai-reference-chip {
   background: var(--surface-hover);
   border: 1px solid var(--border);

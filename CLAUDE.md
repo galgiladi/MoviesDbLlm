@@ -39,11 +39,14 @@ at the repo root, via `concurrently`).
     title/description/rating/genres/actor names. Only ever produces `category: 'actor'` credits (the scraped
     page doesn't distinguish roles or give stable IMDb `nconst`s).
   - `chat.service.ts` + `chat/tools.ts` — the **Ask AI** feature: a two-phase Groq (`groq-sdk`, model from
-    `GROQ_MODEL`) tool-calling loop. Phase 1 streams turns where the model can call four fixed, ES-backed data
-    tools (`search_titles`, `get_title_details`, `get_person_filmography`, `aggregate_titles_by` — defined in
-    `chat/tools.ts`, the entire data-access boundary; the model never gets raw query DSL) until it produces a
-    final text answer with no more tool calls; phase 2 forces one more `answer` tool call (no data tools
-    offered) purely to extract `{ references }` for the UI's clickable chips. See
+    `GROQ_MODEL`, default `openai/gpt-oss-120b`) tool-calling loop. Phase 1 streams turns where the model can
+    call five fixed, ES-backed data tools (`search_titles`, `get_title_details`, `get_person_filmography`,
+    `aggregate_titles_by`, `find_people_by_genre` — defined in `chat/tools.ts`, the entire data-access boundary;
+    the model never gets raw query DSL) until it produces a final text answer with no more tool calls, also
+    streaming a `status` SSE event before each tool call so the UI shows real progress; phase 2 forces one more
+    `answer` tool call (no data tools offered) purely to extract `{ references }` for the UI's clickable chips.
+    The system prompt requires natural, Markdown-formatted answers with no mention of "the database"/tools —
+    the client renders it with `react-markdown` + `remark-gfm`. See
     [docs/ai-chat-search.md](docs/ai-chat-search.md) for the full design and why it replaced an earlier
     context-stuffing version that stopped scaling once the index passed ~1,000 movies.
 - `src/controllers/` + `src/routes/`: `movies`, `actors`, `chat` — thin REST/SSE layer over the services.

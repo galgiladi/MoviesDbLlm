@@ -11,6 +11,7 @@ export interface ChatFinalAnswer {
 
 interface StreamChatAnswerHandlers {
   onToken: (text: string) => void;
+  onStatus: (text: string) => void;
   onFinal: (answer: ChatFinalAnswer) => void;
   onError: (message: string) => void;
 }
@@ -19,7 +20,7 @@ const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 
 export async function streamChatAnswer(
   question: string,
-  { onToken, onFinal, onError }: StreamChatAnswerHandlers,
+  { onToken, onStatus, onFinal, onError }: StreamChatAnswerHandlers,
 ): Promise<void> {
   let response: Response;
   try {
@@ -51,12 +52,12 @@ export async function streamChatAnswer(
     while ((separatorIndex = buffer.indexOf('\n\n')) !== -1) {
       const frame = buffer.slice(0, separatorIndex);
       buffer = buffer.slice(separatorIndex + 2);
-      parseFrame(frame, { onToken, onFinal, onError });
+      parseFrame(frame, { onToken, onStatus, onFinal, onError });
     }
   }
 }
 
-function parseFrame(frame: string, { onToken, onFinal, onError }: StreamChatAnswerHandlers) {
+function parseFrame(frame: string, { onToken, onStatus, onFinal, onError }: StreamChatAnswerHandlers) {
   let event = 'message';
   let data = '';
   for (const line of frame.split('\n')) {
@@ -67,6 +68,7 @@ function parseFrame(frame: string, { onToken, onFinal, onError }: StreamChatAnsw
 
   const parsed = JSON.parse(data);
   if (event === 'token') onToken(parsed.text);
+  else if (event === 'status') onStatus(parsed.text);
   else if (event === 'final') onFinal(parsed);
   else if (event === 'error') onError(parsed.message);
 }

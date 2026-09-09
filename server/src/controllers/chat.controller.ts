@@ -22,6 +22,7 @@ export const postChat = asyncHandler(async (req: Request, res: Response) => {
   try {
     await streamChatAnswer(question.trim(), {
       onToken: (text) => writeEvent(res, 'token', { text }),
+      onStatus: (text) => writeEvent(res, 'status', { text }),
       onFinal: (answer) => writeEvent(res, 'final', answer),
     });
   } catch (err) {
