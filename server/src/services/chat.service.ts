@@ -9,7 +9,14 @@ import { DATA_TOOL_DEFINITIONS, executeDataTool } from './chat/tools';
 const groq = new Groq({ apiKey: env.groqApiKey, maxRetries: 0 });
 
 const ANSWER_TOOL_NAME = 'answer';
-const MAX_TOOL_ITERATIONS = 6;
+// Each iteration resends the whole growing conversation, so a single hard/out-of-scope question
+// that never converges can burn through the free tier's 8000 TPM budget by itself within just a
+// few iterations (observed: ~2000-2700 tokens per turn). Most legitimate questions resolve in
+// 1-3 turns since the search relevance fix, but the exact number varies run to run (sampling
+// non-determinism, not just question difficulty) - 4 was tried and occasionally cut off a
+// question that would have resolved in one more step. 5 is a middle ground: still bounds a
+// runaway/stuck question well below the old cap of 6, without being quite as tight.
+const MAX_TOOL_ITERATIONS = 5;
 
 export interface ChatReference {
   type: 'movie' | 'actor';
@@ -93,9 +100,21 @@ function buildSystemPrompt(): string {
     '(titles, ratings, genres, cast/crew, and aggregate stats) from the site\'s catalog of up to 100,000 movies.',
     '',
     'Always call the tools to look up real data before answering, and never state a specific movie, person,',
-    "rating, or count that a tool result didn't actually give you, and never rely on outside knowledge about",
-    'real movies/actors instead of the tool results. Combine tools as needed — e.g. search_titles then',
-    'get_title_details on a result, or find_people_by_genre to recommend someone known for a given genre.',
+    "rating, count, or biographical/plot fact that a tool result didn't actually give you — this applies even",
+    'to famous facts you already know (e.g. who a well-known character is): if it did not come from a tool',
+    'result, do not say it. Combine tools as needed — e.g. search_titles then get_title_details on a result, or',
+    'find_people_by_genre to recommend someone known for a given genre.',
+    '',
+    'Your tools only cover movies and the real people credited on them (actors, directors, writers, producers)',
+    "— they know nothing about fictional characters as such (backstory, powers, comics lore, etc.). If a",
+    "question is really asking about a character's story/lore rather than movies or real people, say plainly",
+    "that you can only discuss the movies/actors related to them, not the character's story, after at most one",
+    'search to confirm there\'s no relevant movie data — do not keep retrying near-identical searches hoping to',
+    'find lore that was never going to be there.',
+    '',
+    'More generally: if 1-2 tool calls don\'t turn up what you need, do not keep repeating near-identical calls',
+    '(same query reworded) — either try a genuinely different approach once, or stop and give the most honest',
+    'answer you can from what you have, including plainly saying you don\'t have enough information.',
     '',
     `Today's date is ${today}. Resolve relative time ranges (e.g. "the last 10 years") against it.`,
     '',
@@ -264,6 +283,7 @@ async function runChatLoop(question: string, handlers: StreamChatAnswerHandlers)
   let finalText = '';
   const startedAt = Date.now();
   const deadlineAt = startedAt + OVERALL_DEADLINE_MS;
+  const seenToolCalls = new Set<string>();
 
   // Phase 1: let the model call data tools as needed, streaming any text it writes along the
   // way (including interim commentary), until it responds with plain text and no tool calls.
@@ -290,6 +310,27 @@ async function runChatLoop(question: string, handlers: StreamChatAnswerHandlers)
 
     for (const tc of toolCalls) {
       const args = safeParseArgs(tc.args);
+      const signature = `${tc.name}:${tc.args}`;
+
+      // Deterministic guard against the model repeating an exact-duplicate search (observed:
+      // retrying the identical query hoping for a different result) — don't rely on prompt
+      // compliance alone to stop this, since it wastes iterations/latency on a call whose result
+      // we already know. Skip re-executing it and tell the model plainly instead.
+      if (seenToolCalls.has(signature)) {
+        handlers.onStatus(describeToolCall(tc.name, args));
+        messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: JSON.stringify({
+            note: 'You already made this exact call and got the results above — repeating it won\'t change '
+              + 'the outcome. Use what you already have, try a genuinely different approach, or say you '
+              + "don't have enough information.",
+          }),
+        });
+        continue;
+      }
+      seenToolCalls.add(signature);
+
       handlers.onStatus(describeToolCall(tc.name, args));
       const result = await executeDataTool(tc.name, args);
       messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
