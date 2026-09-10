@@ -9,14 +9,14 @@ import { DATA_TOOL_DEFINITIONS, executeDataTool } from './chat/tools';
 const groq = new Groq({ apiKey: env.groqApiKey, maxRetries: 0 });
 
 const ANSWER_TOOL_NAME = 'answer';
-// Each iteration resends the whole growing conversation, so a single hard/out-of-scope question
-// that never converges can burn through the free tier's 8000 TPM budget by itself within just a
-// few iterations (observed: ~2000-2700 tokens per turn). Most legitimate questions resolve in
-// 1-3 turns since the search relevance fix, but the exact number varies run to run (sampling
-// non-determinism, not just question difficulty) - 4 was tried and occasionally cut off a
-// question that would have resolved in one more step. 5 is a middle ground: still bounds a
-// runaway/stuck question well below the old cap of 6, without being quite as tight.
-const MAX_TOOL_ITERATIONS = 5;
+// Each iteration is either a data-gathering step (tool calls) or the final answer-writing step
+// (plain text, no tool calls) - the loop exits the instant a no-tool-call turn happens. That means
+// a question needing exactly N data-gathering calls needs a cap of at least N+1, or it gets cut
+// off one turn short of ever writing the answer (observed directly: a 3-tool-call question failing
+// every time under a cap of 3, succeeding once bumped to 4 - the cap was eating the answer turn
+// itself, not just trimming "flailing"). 4 leaves one such margin while still bounding a
+// genuinely-stuck question well below the original 6.
+const MAX_TOOL_ITERATIONS = 4;
 
 export interface ChatReference {
   type: 'movie' | 'actor';
@@ -119,9 +119,14 @@ function buildSystemPrompt(): string {
     'search to confirm there\'s no relevant movie data — do not keep retrying near-identical searches hoping to',
     'find lore that was never going to be there.',
     '',
-    'More generally: if 1-2 tool calls don\'t turn up what you need, do not keep repeating near-identical calls',
-    '(same query reworded) — either try a genuinely different approach once, or stop and give the most honest',
-    'answer you can from what you have, including plainly saying you don\'t have enough information.',
+    'You have very few tool calls available for each question, so use them decisively. Never call a tool twice',
+    'with the same or a reworded query (e.g. "time travel" then "time traveler") hoping for a different result',
+    "— if a call's result is thin, that IS the answer to work with, not a sign to retry it differently. Pick the",
+    'one tool that best fits the question (semantic_search_plots for a plot/theme, search_titles for a',
+    'title/genre/year, aggregate_titles_by or find_people_by_genre for stats/recommendations-by-role) and commit',
+    'to it — do not also try a second, different tool chasing the same fact. A partial or empty result is still',
+    "an answer: summarize what you have, or say plainly you don't have enough information. Never spend more",
+    'than 2 tool calls total before writing your answer.',
     '',
     `Today's date is ${today}. Resolve relative time ranges (e.g. "the last 10 years") against it.`,
     '',
@@ -142,7 +147,7 @@ interface AccumulatedToolCall {
   args: string;
 }
 
-const PER_CALL_TIMEOUT_MS = 30_000;
+const PER_CALL_TIMEOUT_MS = 20_000;
 
 function isRetryable(err: unknown): boolean {
   return (
@@ -261,9 +266,10 @@ function safeParseArgs(raw: string): Record<string, unknown> {
 
 // Hard ceiling on phase 1's total wall-clock time, independent of how many iterations/retries
 // that involves — so a question that keeps hitting rate limits, or one where the model just
-// can't find the right tool combination, still resolves in a reasonable time instead of the sum
-// of several 30s-timeout-plus-retries iterations stretching out to minutes.
-const OVERALL_DEADLINE_MS = 45_000;
+// can't find the right tool combination, still resolves quickly rather than the sum of several
+// timeout-plus-retries iterations stretching out to something that feels like a hang. Explicit
+// tradeoff: a fast "I don't know" beats a slow, thorough search.
+const OVERALL_DEADLINE_MS = 20_000;
 
 const FALLBACK_NO_INFO = "I wasn't able to find enough information to answer that.";
 const FALLBACK_ERROR = "Sorry, I ran into a problem finding an answer to that — please try asking again in a moment.";
