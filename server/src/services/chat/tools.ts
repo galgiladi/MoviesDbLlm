@@ -8,6 +8,13 @@ import { embedText } from '../embeddings';
 /**
  * Every tool the model can call is a small, hardcoded ES query — never a passthrough for
  * model-authored query DSL. This is the entire data-access boundary for the chat feature.
+ *
+ * Deliberately few, broad tools rather than many narrow ones: each extra tool the model has to
+ * choose between is a chance for it to pick wrong, double up, or oscillate between two that do
+ * almost the same thing (observed directly: search_titles and semantic_search_plots used
+ * redundantly, "recommend a role for a genre" needing its own bespoke tool). search_movies below
+ * folds lexical + semantic search into one hybrid call instead of leaving that choice to the
+ * model; aggregate folds genre-level and person-level aggregation into one shape.
  */
 
 type ToolDefinition = Groq.Chat.Completions.ChatCompletionTool;
@@ -32,7 +39,16 @@ function clampLimit(value: unknown, fallback: number, max: number): number {
   return Math.min(Math.max(n, 1), max);
 }
 
-const searchTitles: ToolExecutor = async (args) => {
+/**
+ * Hybrid search: combines lexical (BM25, operator:'and') and semantic (kNN on plotEmbedding) in
+ * one ES request, so the model doesn't have to choose between "exact keywords" and "matches by
+ * meaning" — Elasticsearch's own scoring blends both. Elastic's one-click hybrid retriever (RRF)
+ * is Enterprise-only (verified against Elastic's docs before building this); this is the
+ * documented free-tier alternative — a plain `query` + `knn` in the same request, combined by
+ * score addition, with `boost` used to bring kNN's ~0-1 cosine range into the same ballpark as
+ * BM25's typically-larger scores.
+ */
+const searchMovies: ToolExecutor = async (args) => {
   const query = asString(args.query);
   const genre = asString(args.genre);
   const yearFrom = asInt(args.yearFrom);
@@ -49,24 +65,43 @@ const searchTitles: ToolExecutor = async (args) => {
     filter.push({ range: { year: { gte: yearFrom, lte: yearTo } } });
   }
 
+  if (!query) {
+    const result = await esClient.search<Movie>({
+      index: TITLES_INDEX,
+      query: filter.length ? { bool: { filter } } : { match_all: {} },
+      size: limit,
+      sort: [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
+    });
+    return toSearchResult(result);
+  }
+
   // operator: 'and' matters a lot here: with the default 'or', a multi-word query like
   // "Spider-Man" tokenizes to ["spider", "man"], and "man" alone is common enough to match tons
-  // of unrelated movies (Iron Man, ...) — which, combined with sorting by popularity, let famous
-  // unrelated blockbusters swamp the real matches. 'and' requires every term to actually appear
-  // (fuzzy-matched, so minor typos are still fine) before a document counts as a hit at all.
-  const must = query
-    ? [{ multi_match: { query, fields: ['title^3', 'description', 'genres'], operator: 'and' as const, fuzziness: 'AUTO' } }]
-    : [{ match_all: {} }];
-
+  // of unrelated movies (Iron Man, ...) — 'and' requires every term to actually appear (still
+  // fuzzy-matched, so minor typos are fine) before a document counts as a lexical hit at all.
   const result = await esClient.search<Movie>({
     index: TITLES_INDEX,
-    query: { bool: { must, filter } },
+    query: {
+      bool: {
+        must: [{ multi_match: { query, fields: ['title^3', 'description', 'genres'], operator: 'and' as const, fuzziness: 'AUTO' } }],
+        filter,
+      },
+    },
+    knn: {
+      field: 'plotEmbedding',
+      query_vector: await embedText(query),
+      k: limit,
+      num_candidates: Math.max(limit * 10, 50),
+      filter: filter.length ? { bool: { filter } } : undefined,
+      boost: 8,
+    },
     size: limit,
-    sort: [{ numVotes: 'desc' as const }, { score: 'desc' as const }],
-  });
+  } as any);
+  return toSearchResult(result);
+};
 
+function toSearchResult(result: Awaited<ReturnType<typeof esClient.search<Movie>>>) {
   const total = typeof result.hits.total === 'number' ? result.hits.total : result.hits.total?.value ?? 0;
-
   return {
     total,
     items: result.hits.hits.map((hit) => {
@@ -74,7 +109,7 @@ const searchTitles: ToolExecutor = async (args) => {
       return { id: m.id, title: m.title, year: m.year, genres: m.genres, score: m.score, numVotes: m.numVotes };
     }),
   };
-};
+}
 
 const getTitleDetails: ToolExecutor = async (args) => {
   const id = asString(args.id);
@@ -125,19 +160,73 @@ const getPersonFilmography: ToolExecutor = async (args) => {
   };
 };
 
-const aggregateTitlesBy: ToolExecutor = async (args) => {
+/**
+ * Unified aggregation: group by genre, or by person+role — one shape instead of two separate
+ * tools (aggregate_titles_by / find_people_by_genre) that did almost the same underlying work.
+ * Adding a new grouping dimension later (e.g. by decade) extends this one tool rather than adding
+ * another bespoke one.
+ */
+const aggregate: ToolExecutor = async (args) => {
+  const dimension = asString(args.dimension);
   const metric = asString(args.metric) ?? 'count';
+  const genre = asString(args.genre);
+  const personCategory = asString(args.personCategory);
   const yearFrom = asInt(args.yearFrom);
   const yearTo = asInt(args.yearTo);
   const limit = clampLimit(args.limit, 10, 25);
 
-  const query = yearFrom !== undefined || yearTo !== undefined
-    ? { range: { year: { gte: yearFrom, lte: yearTo } } }
-    : { match_all: {} };
+  const filter: Record<string, unknown>[] = [];
+  if (yearFrom !== undefined || yearTo !== undefined) {
+    filter.push({ range: { year: { gte: yearFrom, lte: yearTo } } });
+  }
 
+  if (dimension === 'person') {
+    if (genre) filter.push({ term: { genres: genre } });
+
+    const result = await esClient.search<Movie>({
+      index: TITLES_INDEX,
+      query: filter.length ? { bool: { filter } } : { match_all: {} },
+      size: 0,
+      aggs: {
+        credits: {
+          nested: { path: 'credits' },
+          aggs: {
+            matching: {
+              filter: personCategory ? { term: { 'credits.category': personCategory } } : { match_all: {} },
+              aggs: {
+                by_person: {
+                  terms: { field: 'credits.personId', size: limit },
+                  aggs: {
+                    name: { terms: { field: 'credits.name.keyword', size: 1 } },
+                    category: { terms: { field: 'credits.category', size: 1 } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    } as any);
+
+    const buckets = ((result as any).aggregations?.credits?.matching?.by_person?.buckets ?? []) as Array<{
+      key: string;
+      doc_count: number;
+      name: { buckets: { key: string }[] };
+      category: { buckets: { key: string }[] };
+    }>;
+
+    return buckets.map((b) => ({
+      personId: b.key,
+      name: b.name.buckets[0]?.key ?? b.key,
+      category: b.category.buckets[0]?.key,
+      movieCount: b.doc_count,
+    }));
+  }
+
+  // dimension === 'genre' (default)
   const result = await esClient.search<Movie>({
     index: TITLES_INDEX,
-    query,
+    query: filter.length ? { bool: { filter } } : { match_all: {} },
     size: 0,
     aggs: {
       by_genre: {
@@ -165,94 +254,26 @@ const aggregateTitlesBy: ToolExecutor = async (args) => {
   }));
 
   const sortKey = metric === 'avgScore' ? 'avgScore' : metric === 'avgNumVotes' ? 'avgNumVotes' : 'count';
-  rows.sort((a, b) => (b[sortKey] ?? 0) - (a[sortKey] ?? 0));
+  rows.sort((a, b) => (b[sortKey as 'count' | 'avgScore' | 'avgNumVotes'] ?? 0) - (a[sortKey as 'count' | 'avgScore' | 'avgNumVotes'] ?? 0));
 
   return rows.slice(0, limit);
-};
-
-const findPeopleByGenre: ToolExecutor = async (args) => {
-  const genre = asString(args.genre);
-  if (!genre) return { error: 'genre is required' };
-  const category = asString(args.category);
-  const limit = clampLimit(args.limit, 10, 20);
-
-  const result = await esClient.search<Movie>({
-    index: TITLES_INDEX,
-    query: { term: { genres: genre } },
-    size: 0,
-    aggs: {
-      credits: {
-        nested: { path: 'credits' },
-        aggs: {
-          matching: {
-            filter: category ? { term: { 'credits.category': category } } : { match_all: {} },
-            aggs: {
-              by_person: {
-                terms: { field: 'credits.personId', size: limit },
-                aggs: {
-                  name: { terms: { field: 'credits.name.keyword', size: 1 } },
-                  category: { terms: { field: 'credits.category', size: 1 } },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-  } as any);
-
-  const buckets = ((result as any).aggregations?.credits?.matching?.by_person?.buckets ?? []) as Array<{
-    key: string;
-    doc_count: number;
-    name: { buckets: { key: string }[] };
-    category: { buckets: { key: string }[] };
-  }>;
-
-  return buckets.map((b) => ({
-    personId: b.key,
-    name: b.name.buckets[0]?.key ?? b.key,
-    category: b.category.buckets[0]?.key,
-    movieCount: b.doc_count,
-  }));
-};
-
-const semanticSearchPlots: ToolExecutor = async (args) => {
-  const query = asString(args.query);
-  if (!query) return { error: 'query is required' };
-  const limit = clampLimit(args.limit, 6, 10);
-
-  const vector = await embedText(query);
-
-  const result = await esClient.search<Movie>({
-    index: TITLES_INDEX,
-    knn: {
-      field: 'plotEmbedding',
-      query_vector: vector,
-      k: limit,
-      num_candidates: Math.max(limit * 10, 50),
-    },
-  } as any);
-
-  return result.hits.hits.map((hit) => {
-    const m = hit._source as Movie;
-    return { id: m.id, title: m.title, year: m.year, genres: m.genres, score: m.score, numVotes: m.numVotes };
-  });
 };
 
 export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
-      name: 'search_titles',
+      name: 'search_movies',
       description:
-        'Search movies by free-text query and/or filter by genre and year range. Returns { total, items }: ' +
-        '"total" is the full count of matching movies (use this for "how many X movies are there" questions), ' +
-        '"items" is a ranked list of the most well-known matches with basic info. Use this to find candidate ' +
-        'movies before looking up full details with get_title_details.',
+        'Search movies — combines exact keyword matching (title/genre/year) AND matching by meaning/theme/' +
+        'premise in one call, so it works whether the question names a title or describes a plot (e.g. ' +
+        '"Batman" or "a widower finding love again"). Returns { total, items }: "total" is the full count of ' +
+        'matching movies (use for "how many X movies are there" questions), "items" is a ranked list of the ' +
+        'most well-known/relevant matches. Use this to find candidate movies before get_title_details.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: ['string', 'null'], description: 'Free-text search over title/description (optional).' },
+          query: { type: ['string', 'null'], description: 'Free-text search — a title, or a plot/theme description (optional).' },
           genre: { type: ['string', 'null'], description: 'Filter to movies with this exact genre, e.g. "Comedy" (optional).' },
           yearFrom: { type: ['integer', 'null'], description: 'Only movies released in this year or later (optional).' },
           yearTo: { type: ['integer', 'null'], description: 'Only movies released in this year or earlier (optional).' },
@@ -272,7 +293,7 @@ export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: 'The movie id (IMDb tconst), e.g. from search_titles results.' },
+          id: { type: 'string', description: 'The movie id (IMDb tconst), e.g. from search_movies results.' },
         },
         required: ['id'],
       },
@@ -298,78 +319,45 @@ export const DATA_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: 'function',
     function: {
-      name: 'aggregate_titles_by',
+      name: 'aggregate',
       description:
-        'Aggregate movies by genre to answer questions like "which genre has the highest average score" or ' +
-        '"how many action movies are there". Optionally restrict to a year range first.',
+        'Aggregate movies by genre, or by person+role, to answer stats/ranking questions: "which genre has ' +
+        'the highest average score", "how many action movies are there", "recommend an actress who does ' +
+        'action movies", "top directors of the 2010s". Optionally restrict to a year range and/or genre first.',
       parameters: {
         type: 'object',
         properties: {
-          metric: {
+          dimension: {
             type: 'string',
-            enum: ['count', 'avgScore', 'avgNumVotes'],
-            description: 'What to rank genres by.',
+            enum: ['genre', 'person'],
+            description: '"genre" ranks genres against each other; "person" ranks people (optionally by role).',
           },
-          yearFrom: { type: ['integer', 'null'], description: 'Only consider movies released in this year or later (optional).' },
-          yearTo: { type: ['integer', 'null'], description: 'Only consider movies released in this year or earlier (optional).' },
-          limit: { type: ['integer', 'null'], description: 'Max genres to return, sorted by metric descending (default 10).' },
-        },
-        required: ['metric'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'find_people_by_genre',
-      description:
-        'Find which people appear most often in movies of a given genre, optionally restricted to one role ' +
-        '(actor, actress, director, writer, or producer). Use this for "recommend a/an <role> who does ' +
-        '<genre> movies" style questions instead of manually cross-referencing many individual movies.',
-      parameters: {
-        type: 'object',
-        properties: {
-          genre: { type: 'string', description: 'Genre to filter by, e.g. "Action".' },
-          category: {
+          metric: {
+            type: ['string', 'null'],
+            enum: ['count', 'avgScore', 'avgNumVotes', null],
+            description: 'For dimension "genre": what to rank genres by (default "count").',
+          },
+          personCategory: {
             type: ['string', 'null'],
             enum: ['actor', 'actress', 'director', 'writer', 'producer', null],
-            description: 'Optional: restrict to one credit role.',
+            description: 'For dimension "person": optionally restrict to one credit role.',
           },
-          limit: { type: ['integer', 'null'], description: 'Max people to return, sorted by movie count descending (default 10, max 20).' },
+          genre: { type: ['string', 'null'], description: 'For dimension "person": optionally restrict to one genre (optional).' },
+          yearFrom: { type: ['integer', 'null'], description: 'Only consider movies released in this year or later (optional).' },
+          yearTo: { type: ['integer', 'null'], description: 'Only consider movies released in this year or earlier (optional).' },
+          limit: { type: ['integer', 'null'], description: 'Max rows to return, sorted descending (default 10, max 25).' },
         },
-        required: ['genre'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'semantic_search_plots',
-      description:
-        'Find movies by what happens in them, their theme, or premise — matched by meaning, not exact ' +
-        'keywords (e.g. "a widower finding love again", "heist that goes wrong", "kids on a magical ' +
-        'adventure"). Use this instead of search_titles when the question describes a plot/theme rather ' +
-        'than a specific title, genre, or year. Only finds movies that have a real plot summary indexed — ' +
-        'a miss here does not mean the movie is not in the catalog, just that it has no summary to match.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'A description of the plot, theme, or premise to search for.' },
-          limit: { type: ['integer', 'null'], description: 'Max results to return (default 6, max 10).' },
-        },
-        required: ['query'],
+        required: ['dimension'],
       },
     },
   },
 ];
 
 const EXECUTORS: Record<string, ToolExecutor> = {
-  search_titles: searchTitles,
+  search_movies: searchMovies,
   get_title_details: getTitleDetails,
   get_person_filmography: getPersonFilmography,
-  aggregate_titles_by: aggregateTitlesBy,
-  find_people_by_genre: findPeopleByGenre,
-  semantic_search_plots: semanticSearchPlots,
+  aggregate,
 };
 
 export async function executeDataTool(name: string, args: Record<string, unknown>): Promise<unknown> {

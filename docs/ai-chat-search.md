@@ -1,6 +1,7 @@
 # AI Chat "Smart Search" on the Movies Page
 
-Status: implemented (tool-calling design, v2 — see History below for the superseded v1).
+Status: implemented (tool-calling design, v3 — see History below for the superseded v1 and the v2→v3
+tool-consolidation rationale).
 
 ## Context
 
@@ -25,28 +26,29 @@ Decisions made along the way:
 - **Data-access approach**: **real tool-calling against Elasticsearch**, replacing the original "stuff the
   whole index into context" design (see History). This is RAG in the general sense (retrieve, then generate
   grounded in what came back) — it has been since this redesign, not something new added with plot summaries.
-  The model is given six fixed, backend-defined tools — never a passthrough for model-authored query DSL, so
+  The model is given four fixed, backend-defined tools — never a passthrough for model-authored query DSL, so
   the injection/DoS risk that motivated the original design never comes back:
-  - `search_titles(query?, genre?, yearFrom?, yearTo?, limit?)` — ranked movie search; returns
-    `{ total, items }` so "how many X movies are there" questions can be answered from the accurate total count,
-    not just the trimmed `items` list. **Lexical** (keyword) matching only — see the semantic tool below for
-    the gap this leaves.
+  - `search_movies(query?, genre?, yearFrom?, yearTo?, limit?)` — **hybrid** search: combines lexical (BM25,
+    `operator: 'and'`) and semantic (kNN on `plotEmbedding`) in one ES request, so the model doesn't have to
+    choose between "exact keywords" and "matches by meaning" — see "Hybrid search" below. Returns
+    `{ total, items }` so "how many X movies are there" questions can be answered from the accurate total count.
   - `get_title_details(id)` — full details + credits for one movie
   - `get_person_filmography(name, limit?)` — look up a person, return their filmography with roles
-  - `aggregate_titles_by(metric, yearFrom?, yearTo?, limit?)` — genre-level aggregation (count/avgScore/avgNumVotes)
-  - `find_people_by_genre(genre, category?, limit?)` — nested aggregation that finds which people appear most
-    often in movies of a given genre (optionally filtered to one role) — added specifically to answer
-    "recommend a/an `<role>` who does `<genre>` movies" in one call instead of the model manually
-    cross-referencing many individual `get_title_details` calls
-  - `semantic_search_plots(query, limit?)` — **semantic** (embedding/kNN) search over `plotEmbedding`, for
-    questions describing a theme/premise rather than a title/genre/year (e.g. "a widower finding love again"),
-    where lexical matching in `search_titles` would miss a plot with the same meaning but different wording.
-    See "Semantic search" below for the full design.
+  - `aggregate(dimension: 'genre'|'person', metric?, personCategory?, genre?, yearFrom?, yearTo?, limit?)` —
+    unified aggregation: `dimension: 'genre'` ranks genres against each other (count/avgScore/avgNumVotes);
+    `dimension: 'person'` ranks people (optionally by role, optionally within one genre) — answers "which genre
+    has the highest average score", "how many action movies are there", "recommend an actress who does action
+    movies", "top directors of the 2010s" from one tool shape.
 
   Each tool hardcodes its own ES query shape (`server/src/services/chat/tools.ts`); the model only ever supplies
   the tool's declared arguments (a search string, a genre, a year range, an id), never a query body.
 
-- **Search relevance**: `search_titles`'s `multi_match` uses `operator: 'and'` (not the default `'or'`) — a
+  **This started as six tools** (`search_titles` and `semantic_search_plots` as two the model had to choose
+  between; `find_people_by_genre` as a bespoke tool alongside `aggregate_titles_by`) and was deliberately
+  consolidated down to four — see "Tool consolidation" under History for why that mattered in practice, not
+  just in theory.
+
+- **Search relevance**: `search_movies`'s `multi_match` uses `operator: 'and'` (not the default `'or'`) — a
   real bug found and fixed after testing: with `'or'`, a multi-word query like "Spider-Man" tokenizes to
   ["spider", "man"], and "man" alone is common enough to match tons of unrelated movies (Iron Man, ...), which
   combined with sorting by popularity let famous unrelated blockbusters swamp genuinely relevant results
@@ -63,7 +65,7 @@ Decisions made along the way:
 **Two-phase tool-calling loop, server-side.** The client POSTs the question to `/api/chat`; the server:
 
 1. **Phase 1 — gather + answer** (`streamChatAnswer` in `server/src/services/chat.service.ts`): loops up to
-   `MAX_TOOL_ITERATIONS` (6) times, each time streaming one Groq chat-completion turn with the five data tools
+   `MAX_TOOL_ITERATIONS` (4) times, each time streaming one Groq chat-completion turn with the four data tools
    available (`tool_choice: 'auto'`). Any text the model writes during the loop (including interim commentary
    like "let me check that") is forwarded live as SSE `token` events — this is a deliberate choice: it keeps
    the UX simple (the frontend just concatenates every token event into one growing answer) and is a common,
@@ -89,7 +91,7 @@ single tool call's arguments can arrive split across many chunks.
 
 ## Key files
 
-- `server/src/services/chat/tools.ts` — the five data-tool JSON-schema definitions + their ES-backed
+- `server/src/services/chat/tools.ts` — the four data-tool JSON-schema definitions + their ES-backed
   implementations (the entire data-access boundary; no other code path lets the model reach Elasticsearch)
 - `server/src/services/chat.service.ts` — the two-phase Groq loop described above, the `answer` tool
   definition, the system prompt, `describeToolCall()` (status-line text), and the retry/timeout handling below
@@ -108,7 +110,7 @@ Two separate rate-limit dimensions were hit and handled during testing, both sur
   every tool result gets echoed back into the growing conversation for every subsequent call in the loop.
   `withRetry()` in `chat.service.ts` parses the wait hint and actually waits it out (up to 3 attempts) instead
   of retrying immediately into the same still-exhausted window. Tool result sizes were also trimmed down
-  (`search_titles` capped to 6-10 items, `get_person_filmography` to 10-20) specifically to reduce how much
+  (`search_movies` capped to 6-10 items, `get_person_filmography` to 10-20) specifically to reduce how much
   each call adds to the running total.
 - **Tokens-per-day (observed: 200,000 TPD)** — a much harder wall with a much slower recovery (a rolling
   window, not a fixed midnight reset); heavy back-to-back testing can exhaust it for hours. There's no code-side
@@ -119,20 +121,33 @@ A hard per-call deadline (`PER_CALL_TIMEOUT_MS`, 30s, via `AbortSignal.timeout()
 Groq call — the client's own `timeout` option was observed to not cover a stream that goes silent mid-flight
 (a stalled stream produced zero chunks for 60s+ with no error before this was added).
 
-## Semantic search (plot embeddings)
+## Hybrid search (lexical + semantic, one tool)
 
 Added once real plot summaries existed (see `docs/PLAN.md`'s plot-summary note) — before that, there was no
-real content to search semantically. Elasticsearch does have a built-in one-click semantic field
-(`semantic_text`), but it's **Enterprise-license only**; the free/Basic tier this project runs on (no auth,
-`docker-compose.yml`) only includes the lower-level building block — `dense_vector` field + kNN search, where
-*we* generate the embedding vectors ourselves and ES just indexes/searches them (confirmed against Elastic's
-own docs before building this, not assumed).
+real content to search semantically. Elasticsearch has two built-in one-click hybrid/semantic features —
+`semantic_text` fields and the RRF `retriever` framework — but **both are Enterprise-license only** (confirmed
+against Elastic's own docs before building either version of this feature, not assumed). The free/Basic tier
+this project runs on (no auth, `docker-compose.yml`) only includes the lower-level building blocks: a
+`dense_vector` field + kNN search, where *we* generate the embedding vectors ourselves and ES just
+indexes/searches them, and a plain top-level `query` clause — both of which **can be combined in a single
+`_search` request** (`query` + `knn` side by side), with ES adding the two sets of scores together. That's the
+free-tier substitute for RRF used here: not as principled as a real rank-fusion, but genuinely hybrid (a
+document can surface from either signal, or score higher for matching both), and it needed no license upgrade.
+
+`search_movies` (`server/src/services/chat/tools.ts`) issues exactly this combined request whenever a `query`
+string is given: a `bool`/`must` `multi_match` (lexical, `operator: 'and'`, see "Search relevance" above) plus a
+`knn` clause against `plotEmbedding` (semantic), with the `knn` score `boost`ed (currently 8×) so a strong
+semantic match isn't drowned out by BM25's typically-larger score range. Any `genre`/`yearFrom`/`yearTo` filters
+apply to both clauses identically via a shared `filter` array. This replaced two separate v2 tools
+(`search_titles` for lexical-only, `semantic_search_plots` for semantic-only) that the model had to choose
+between — see "Tool consolidation" in History for why merging them mattered in practice, not just in theory.
 
 - **Embedding model**: local, not a hosted API — `@huggingface/transformers` running `Xenova/all-MiniLM-L6-v2`
   in-process (`server/src/services/embeddings.ts`), 384 dims, ~30ms/embedding on CPU. Deliberately not a free
-  hosted embedding API: unlike the one-time TMDb backfill, embeddings are also needed on the *live* path (every
-  user question needs embedding at ask-time), and this project has already been burned repeatedly by free-tier
-  rate limits (Groq) — a rate-limited embedding API would just move that problem onto the search path too.
+  hosted embedding API: embeddings are needed on the *live* query path too (every user question needs embedding
+  at ask-time, via the same `embedText()` used for indexing), and this project has already been burned
+  repeatedly by free-tier rate limits (Groq) — a rate-limited embedding API would just move that problem onto
+  the search path too.
 - **Intel Mac gotcha**: `onnxruntime-node` (the native runtime `@huggingface/transformers` uses) dropped the
   `darwin-x64` binary in current versions — only `darwin-arm64` (Apple Silicon) ships now. `server/package.json`
   pins it back via `overrides.onnxruntime-node: "1.19.0"`, the last version confirmed to still include it.
@@ -147,12 +162,12 @@ own docs before building this, not assumed).
 - **Backfill pipeline** (two separate resumable scripts, run in order): `npm run enrich:plots` (TMDb plot
   summaries) → `npm run enrich:embeddings` (embeds them). The embedding script skips any movie still on the
   templated description (reconstructs the exact template string to detect this) — nothing meaningful to embed
-  there, and embedding a generic templated sentence would just pollute semantic search results with
-  near-duplicate noise across every movie of the same genre.
-- **The tool**: `semantic_search_plots(query, limit?)` embeds the query the same way and runs an ES `knn`
-  search against `plotEmbedding`. It only ever finds movies that got a real embedding — a miss doesn't mean
-  the movie isn't in the catalog, just that it has no indexed plot to match against (surfaced in the tool's own
-  description so the model doesn't over-conclude from an empty result).
+  there, and embedding a generic templated sentence would just pollute semantic scoring with near-duplicate
+  noise across every movie of the same genre. Result: 100,000 scanned, 98,567 embedded, 1,433 skipped as
+  still-templated.
+- A movie with no embedding (still-templated description) simply can't contribute a `knn` hit — it can still
+  surface via the lexical half of the same query, so a themed search never fully excludes un-enriched movies,
+  it just can't semantically match them.
 
 ## Config
 
@@ -175,34 +190,40 @@ free-tier models change over time; if the configured model starts returning `mod
    `/movies/:id` or `/actors/:id` page with matching data.
 6. Try a question needing a specific person lookup (e.g. "what has Christopher Nolan directed?") to exercise
    `get_person_filmography`, an aggregation question (e.g. "which genre has the highest average score?") to
-   exercise `aggregate_titles_by`, a count question (e.g. "how many batman movies are there?") to exercise
-   `search_titles`'s `total`, and a recommendation question (e.g. "recommend an actress who does action
-   movies") to exercise `find_people_by_genre`.
+   exercise `aggregate` with `dimension: 'genre'`, a count question (e.g. "how many batman movies are there?")
+   to exercise `search_movies`'s `total`, and a recommendation question (e.g. "recommend an actress who does
+   action movies") to exercise `aggregate` with `dimension: 'person'`.
 7. Run `npm run enrich:plots` then `npm run enrich:embeddings` (no `TMDB_API_KEY` needed for the latter — fully
    local), then try a plot/theme question with wording that wouldn't lexically match the actual plot text (e.g.
-   "a widower finding love again") to confirm `semantic_search_plots` gets used and returns a sensible match —
-   this is the one that wouldn't have worked via `search_titles` alone.
+   "a widower finding love again") to confirm `search_movies` returns a sensible match via its semantic half —
+   this is the class of question that wouldn't have worked via lexical matching alone. Also try a query that
+   needs *both* halves at once (e.g. "time travel movies from 2000-2010" — "time travel" matches best
+   semantically, the year range is a lexical/filter concern) to confirm the combined `query`+`knn` request
+   handles both in the single tool call, rather than needing two separate tool calls like the old v2 design did.
 8. Try a nonsense question to confirm the model returns a coherent "I don't know" rather than hallucinating
    references.
 9. Confirm the answer renders as actual formatted Markdown (bold, tables, lists) in the panel, not literal
    `**`/`|`/`-` characters, and that it reads naturally with no mention of "the database" or "search results".
 
 **Status as of the last session**: items 1-3 and the raw `curl` check in item 4 were verified directly against
-Elasticsearch/the API (confirmed: `search_titles("batman")` now correctly returns only real Batman movies
-with an accurate `total`; `find_people_by_genre` returns genuine, recognizable action actresses; one full
-`curl` round-trip produced a well-formatted, natural-sounding Markdown answer). Item 5 (the actual rendered
-browser UI) was **not visually confirmed** — testing was blocked by Groq's free-tier daily token limit
-(200,000 TPD) being exhausted from the session's own testing before a clean screenshot could be captured.
-Worth a real look before relying on it.
+Elasticsearch/the API (confirmed: `search_movies("batman")` now correctly returns only real Batman movies
+with an accurate `total`; `aggregate` with `dimension: 'person'` returns genuine, recognizable action
+actresses; one full `curl` round-trip produced a well-formatted, natural-sounding Markdown answer). Item 5
+(the actual rendered browser UI) was **not visually confirmed** — testing was blocked by Groq's free-tier daily
+token limit (200,000 TPD) being exhausted from the session's own testing before a clean screenshot could be
+captured. Worth a real look before relying on it.
 
-**Semantic search (item 7)**: `semantic_search_plots`'s ES-layer logic was verified directly (bypassing the
-LLM) with genuinely on-theme results for "a widower finding love again" and "a heist that goes wrong" — real
-semantic matches, not keyword coincidences. The model reliably picks this tool over `search_titles` for
-thematic questions (confirmed via the `status` event each time). A full live round-trip through Groq was
-**not cleanly confirmed** — both attempts hit the same tokens-per-minute ceiling documented under "Reliability
-notes" above (this question needs 3-4 tool calls, and my own repeated testing in the same short window used up
-the shared budget). This isn't a new problem specific to this tool; it's the same pre-existing tension. Worth
-retrying fresh (i.e. not right after other heavy testing) before concluding either way.
+**Hybrid search (item 7)**: `search_movies`'s ES-layer logic was verified directly (bypassing the LLM) across
+four cases — a pure-lexical query ("batman"), a pure-semantic query ("a widower finding love again"), a
+combined hybrid+filter query ("time travel movies from 2000-2010"), and both `aggregate` dimensions — with
+genuinely on-theme, correct results in each case; the hybrid case specifically surfaced "Happy Accidents" (a
+time-travel movie matched by meaning, not by the literal phrase) which the old two-tool v2 design's separate
+`search_titles`/`semantic_search_plots` calls had missed in earlier testing. A full live round-trip through
+Groq confirmed the practical win: the same "time travel movies from 2000-2010" question that previously took
+2-4 tool calls under v2 (the model trying `search_titles`, then retrying, then `semantic_search_plots`) now
+resolves in a **single** `search_movies` call with correct, better-quality results. Repeated heavy testing in
+this session did eventually re-exhaust the Groq daily token limit (documented under "Reliability notes"
+above) — a pre-existing, unrelated constraint, not a regression from this change.
 
 ## Known limitation
 
@@ -223,3 +244,34 @@ raised to 100,000 movies (an entire-index dump no longer fits in a prompt), and 
 the first 20 movies as a stopgap (`moviesContext.service.ts`, now deleted) until this tool-calling redesign
 replaced it entirely, together with the switch to Groq. Nothing from `moviesContext.service.ts` carries over —
 retrieval is now real per-question ES queries via the tools above, not a cached, capped snapshot.
+
+## History (v2 → v3: tool consolidation)
+
+The v2 design had six tools: `search_titles` (lexical only), `semantic_search_plots` (semantic only, added
+once plot embeddings existed), `get_title_details`, `get_person_filmography`, `aggregate_titles_by` (genre
+aggregation), and `find_people_by_genre` (a bespoke tool added on top of `aggregate_titles_by` specifically for
+"recommend a `<role>` who does `<genre>` movies" questions). In practice this ran into real, observed problems
+that motivated the v3 rework:
+
+- **Choice overhead was itself a failure mode.** With `search_titles` and `semantic_search_plots` as two
+  separate options, the model sometimes had to guess which one a question needed, and when it guessed wrong (or
+  hedged by trying both) that cost extra tool calls — directly colliding with the tight Groq free-tier rate
+  limits (see "Reliability notes"). A live-tested example: "time travel movies from 2000-2010" needed 2-4 tool
+  calls under v2 (try lexical, get a weak result, retry semantic, sometimes retry again) before v3 resolved the
+  identical question in one `search_movies` call.
+- **More tools meant more chances to pick the wrong one entirely**, not just the lexical/semantic split —
+  `find_people_by_genre` existing as a separate tool from `aggregate_titles_by` was the same problem in a
+  different shape.
+- **The fix wasn't "add more tools" (a path considered and rejected)** — it was the opposite: use Elasticsearch
+  more natively so *one* tool could cover more ground per call, and shrink the total tool surface so the model
+  has fewer decisions to get wrong. Before doing this, ES's own built-in answer to "combine lexical + semantic
+  in one request" (the RRF `retriever` framework, and `semantic_text` fields) was checked against Elastic's
+  docs and confirmed **Enterprise-license only** — not available on this project's free/Basic self-managed
+  setup. The free-tier equivalent — a top-level `query` plus a `knn` clause in the same `_search` call, scores
+  combined by addition — was verified to actually work (tested directly against ES) and is what `search_movies`
+  uses now (see "Hybrid search" above). `aggregate_titles_by` and `find_people_by_genre` were similarly merged
+  into one `aggregate` tool with a `dimension: 'genre'|'person'` switch.
+- Net result: six tools → four (`search_movies`, `get_title_details`, `get_person_filmography`, `aggregate`),
+  verified both at the ES layer directly (batman lexical search, widower semantic search, time-travel hybrid
+  search, both aggregate dimensions all correct) and via a live Groq round-trip showing fewer tool calls and
+  equal-or-better answer quality on the same test questions used to validate v2.

@@ -40,7 +40,7 @@ interface StreamChatAnswerHandlers {
  * plain language, the way a person helping you look something up would narrate it. */
 function describeToolCall(name: string, args: Record<string, unknown>): string {
   switch (name) {
-    case 'search_titles': {
+    case 'search_movies': {
       const query = typeof args.query === 'string' && args.query ? `"${args.query}"` : undefined;
       const genre = typeof args.genre === 'string' && args.genre ? args.genre : undefined;
       if (query) return `Searching for ${query}…`;
@@ -53,14 +53,11 @@ function describeToolCall(name: string, args: Record<string, unknown>): string {
       const name = typeof args.name === 'string' && args.name ? args.name : 'them';
       return `Looking up ${name}'s filmography…`;
     }
-    case 'aggregate_titles_by':
+    case 'aggregate': {
+      const genre = typeof args.genre === 'string' && args.genre ? args.genre : undefined;
+      if (args.dimension === 'person') return genre ? `Finding notable names in ${genre}…` : 'Finding notable names…';
       return 'Crunching the numbers…';
-    case 'find_people_by_genre': {
-      const genre = typeof args.genre === 'string' && args.genre ? args.genre : 'that genre';
-      return `Finding notable names in ${genre}…`;
     }
-    case 'semantic_search_plots':
-      return 'Looking for movies with a similar plot…';
     default:
       return 'Looking that up…';
   }
@@ -104,29 +101,23 @@ function buildSystemPrompt(): string {
     'Always call the tools to look up real data before answering, and never state a specific movie, person,',
     "rating, count, or biographical/plot fact that a tool result didn't actually give you — this applies even",
     'to famous facts you already know (e.g. who a well-known character is): if it did not come from a tool',
-    'result, do not say it. Combine tools as needed — e.g. search_titles then get_title_details on a result, or',
-    'find_people_by_genre to recommend someone known for a given genre.',
-    '',
-    'search_titles matches title/genre/exact words only. When the question describes a plot, theme, or premise',
-    '("a movie about...", "something like X but...", a mood or setting) rather than naming a title/genre/year,',
-    'use semantic_search_plots instead — it matches by meaning. It only covers movies with an indexed plot',
-    "summary, so a miss there doesn't mean the movie isn't in the catalog at all.",
+    'result, do not say it. search_movies already matches both exact keywords AND meaning/theme in one call, so',
+    'use it for any movie search regardless of whether the question names a title or describes a plot — no need',
+    'to pick between a "keyword" and a "meaning" search. Combine tools as needed — e.g. search_movies then',
+    'get_title_details on a result, or aggregate to recommend someone known for a given genre.',
     '',
     'Your tools only cover movies and the real people credited on them (actors, directors, writers, producers)',
-    "— they know nothing about fictional characters as such (backstory, powers, comics lore, etc.). If a",
-    "question is really asking about a character's story/lore rather than movies or real people, say plainly",
-    "that you can only discuss the movies/actors related to them, not the character's story, after at most one",
-    'search to confirm there\'s no relevant movie data — do not keep retrying near-identical searches hoping to',
-    'find lore that was never going to be there.',
+    "— they know nothing about fictional characters as such (backstory, powers, comics lore, etc.), and nothing",
+    "about a movie's soundtrack/song lyrics (only its plot). If a question is really asking about a character's",
+    "story/lore or song content rather than movies, real people, or plot, say plainly that you can only discuss",
+    "the movies/plots/people you do have, after at most one search to confirm there's no relevant movie data —",
+    'do not keep retrying near-identical searches hoping to find something that was never going to be there.',
     '',
-    'You have very few tool calls available for each question, so use them decisively. Never call a tool twice',
-    'with the same or a reworded query (e.g. "time travel" then "time traveler") hoping for a different result',
-    "— if a call's result is thin, that IS the answer to work with, not a sign to retry it differently. Pick the",
-    'one tool that best fits the question (semantic_search_plots for a plot/theme, search_titles for a',
-    'title/genre/year, aggregate_titles_by or find_people_by_genre for stats/recommendations-by-role) and commit',
-    'to it — do not also try a second, different tool chasing the same fact. A partial or empty result is still',
-    "an answer: summarize what you have, or say plainly you don't have enough information. Never spend more",
-    'than 2 tool calls total before writing your answer.',
+    'You have very few tool calls available for each question, so use them decisively. Never call the same tool',
+    'twice with the same or a reworded query (e.g. "time travel" then "time traveler") hoping for a different',
+    "result — if a call's result is thin, that IS the answer to work with, not a sign to retry it differently.",
+    'A partial or empty result is still an answer: summarize what you have, or say plainly you don\'t have',
+    'enough information. Never spend more than 2 tool calls total before writing your answer.',
     '',
     `Today's date is ${today}. Resolve relative time ranges (e.g. "the last 10 years") against it.`,
     '',

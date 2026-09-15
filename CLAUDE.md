@@ -40,15 +40,21 @@ at the repo root, via `concurrently`).
     page doesn't distinguish roles or give stable IMDb `nconst`s).
   - `chat.service.ts` + `chat/tools.ts` — the **Ask AI** feature: a two-phase Groq (`groq-sdk`, model from
     `GROQ_MODEL`, default `openai/gpt-oss-120b`) tool-calling loop. Phase 1 streams turns where the model can
-    call six fixed, ES-backed data tools (`search_titles`, `get_title_details`, `get_person_filmography`,
-    `aggregate_titles_by`, `find_people_by_genre`, `semantic_search_plots` — defined in `chat/tools.ts`, the
-    entire data-access boundary; the model never gets raw query DSL) until it produces a final text answer with
-    no more tool calls, also streaming a `status` SSE event before each tool call so the UI shows real progress;
-    phase 2 forces one more `answer` tool call (no data tools offered) purely to extract `{ references }` for
-    the UI's clickable chips. The system prompt requires natural, Markdown-formatted answers with no mention of
-    "the database"/tools — the client renders it with `react-markdown` + `remark-gfm`. See
-    [docs/ai-chat-search.md](docs/ai-chat-search.md) for the full design and why it replaced an earlier
-    context-stuffing version that stopped scaling once the index passed ~1,000 movies.
+    call four fixed, ES-backed data tools (`search_movies`, `get_title_details`, `get_person_filmography`,
+    `aggregate` — defined in `chat/tools.ts`, the entire data-access boundary; the model never gets raw query
+    DSL) until it produces a final text answer with no more tool calls, also streaming a `status` SSE event
+    before each tool call so the UI shows real progress; phase 2 forces one more `answer` tool call (no data
+    tools offered) purely to extract `{ references }` for the UI's clickable chips. The system prompt requires
+    natural, Markdown-formatted answers with no mention of "the database"/tools — the client renders it with
+    `react-markdown` + `remark-gfm`. **Deliberately few, broad tools**: `search_movies` folds lexical (BM25) and
+    semantic (kNN) search into one hybrid call (Elastic's one-click RRF hybrid retriever is Enterprise-only —
+    verified against Elastic's docs — so this uses the documented free-tier alternative, a plain `query` + `knn`
+    in one request, scores combined by addition); `aggregate` folds genre-level and person-level aggregation
+    into one shape via a `dimension` param. Started as six separate tools (including `search_titles` +
+    `semantic_search_plots` as two tools the model had to choose between, and a bespoke `find_people_by_genre`)
+    but that turned out to be exactly the wrong shape — more tools to choose between meant more chances to pick
+    wrong or call two redundantly, which was directly responsible for several live failures. See
+    [docs/ai-chat-search.md](docs/ai-chat-search.md) for the full design history.
   - `embeddings.ts` — local (CPU, no API key, no rate limits) text embeddings via
     `@huggingface/transformers` running `Xenova/all-MiniLM-L6-v2` in-process (384 dims). Backs both the
     one-time `enrich:embeddings` backfill and `semantic_search_plots`'s live query embedding. **Important**:
@@ -128,8 +134,4 @@ each entry's role). `api/` holds typed fetch wrappers (`client.ts` reads `VITE_A
   same year" isn't a single efficient tool call today, since `people.filmography` entries don't carry the
   title's genre/year (see `docs/PLAN.md`) — the model would have to chain several `get_title_details` calls
   and reason over the results itself. Documented in `docs/ai-chat-search.md`'s "Known limitation".
-- **`find_people_by_genre` tool design**: added to answer "recommend a/an `<role>` for `<genre>` movies", but
-  flagged as the wrong general shape — a bespoke tool per question pattern doesn't scale. Should be merged
-  with `aggregate_titles_by` into one general aggregation tool (group by genre *or* by person+role) before
-  adding more capabilities in this family; not done yet, left as one tool for now.
 - **tvSeries / videoGame titles**: explicitly out of scope for now; the pipeline only indexes `titleType=movie`.
